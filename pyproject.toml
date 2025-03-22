@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scSherlock"
+version = "0.1.0"
+description = "A Python library for identifying marker genes in scRNAseq"
+readme = "README.md"
+authors = [
+    {name = "Hugo Croizer", email = "hugocroizer83330@gmail.com"},
+]
+license = {text = "MIT"}
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+keywords = ["scRNAseq", "Markers"]
+dependencies = [
+    "geopandas",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "plotly",
+    "scipy", 
+    "shapely",
+]
+requires-python = ">=3.8"
+
+[project.urls]
+Homepage = "https://github.com/Dantferno/scSherlock"
+Documentation = "https://scSherlock.readthedocs.io"
+Repository = "https://github.com/Dantferno/scSherlock"
+
+[tool.setuptools]
+packages = ["histomap"]  # Explicitly list only your main package directory
