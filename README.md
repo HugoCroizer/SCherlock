@@ -6,29 +6,11 @@ scSherlock is a statistical algorithm for identifying cell type-specific marker 
 
 Documentation is available here : 
 
-## Features
-
-- Statistically rigorous marker gene identification
-- Support for multiple cell types and patient samples
-- Theoretical and empirical validation of marker predictions
-- Flexible scoring methods to prioritize sensitivity or specificity
-- Visualization tools for marker gene evaluation
-
 ## Installation
 
 ```bash
 pip install scsherlock
 ```
-
-## Requirements
-
-- Python 3.6+
-- scanpy
-- numpy
-- pandas
-- scipy
-- matplotlib
-- seaborn
 
 ## Quick Start
 
