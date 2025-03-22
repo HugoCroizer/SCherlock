@@ -1,7 +1,7 @@
 # scSherlock
 
 ## Overview
-<img src="images/logo.png" align="right" width="100px" />
+<img src="images/logo.png" align="right" width="125px" />
 scSherlock is a statistical algorithm for identifying cell type-specific marker genes from single-cell RNA sequencing data. The algorithm uses probabilistic models to identify genes that are specifically expressed in target cell types but not in other cell types, making them reliable markers for cell type identification.  
 
 Documentation is available here : 
