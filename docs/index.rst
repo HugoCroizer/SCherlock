@@ -56,6 +56,7 @@ Contents
    
    installation/index
    quickstart
+   principle/index
    tutorials/index
    examples/index
    paper
