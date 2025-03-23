@@ -1,73 +1,51 @@
+.. installation.rst
+
+============
 Installation
+============
+
+Requirements
 ===========
-.. image:: ../images/logo.png
-   :align: right
-   :width: 150px
 
-This guide covers different methods to install scSherlock, with Conda being the recommended approach.
+scSherlock requires:
 
-Conda Installation (Recommended)
--------------------------------
+* Python 3.8 or later
+* NumPy (>= 1.20.0)
+* pandas (>= 1.3.0)
+* scipy (>= 1.7.0)
+* matplotlib (>= 3.4.0)
+* scanpy (>= 1.9.0)
+* anndata (>= 0.8.0)
 
-The recommended way to install scSherlock is using Conda, which helps manage dependencies efficiently:
+Standard Installation
+====================
 
-1. First, make sure you have Conda installed (either `Miniconda <https://docs.conda.io/en/latest/miniconda.html>`_ or `Anaconda <https://www.anaconda.com/products/distribution>`_)
-
-2. Create a new environment for scSherlock:
-
-   .. code-block:: bash
-
-      conda create -n scSherlock python=3.10
-      conda activate scSherlock
-
-3. Install required dependencies:
-
-   .. code-block:: bash
-
-      conda install -c conda-forge  pandas numpy matplotlib plotly scipy shapely
-      conda install -c conda-forge jupyterlab  # for running tutorial notebooks
-
-4. Install scSherlock using pip:
-
-   .. code-block:: bash
-
-      pip install scSherlock
-
-Pip Installation
---------------
-
-If you prefer using pip, you can install scSherlock directly:
+You can install scSherlock using pip:
 
 .. code-block:: bash
 
    pip install scSherlock
 
-Note that you'll need to ensure all dependencies are properly installed, which may be more challenging than using Conda.
+Development Installation
+======================
 
+To install the development version from GitHub:
+
+.. code-block:: bash
+
+   pip install git+https://github.com/HugoCroizer/scSherlock.git
 
 Troubleshooting
--------------
+==============
 
-Common installation issues and their solutions:
+If you encounter any issues during installation, please:
 
+1. Ensure you have the latest version of pip:
 
-Platform-Specific Notes
-^^^^^^^^^^^^^^^^^^^^^
+   .. code-block:: bash
+   
+      pip install --upgrade pip
 
-**Windows Users**:
-   Shapely and other geospatial libraries might require additional steps. Using Conda is strongly recommended.
+2. If you're using a virtual environment (recommended), make sure it's activated.
 
-**Mac M1/M2 Users**:
-   Make sure to use the arm64 version of Conda for best performance.
-
-Verifying Installation
--------------------
-
-To verify scSherlock is correctly installed, run:
-
-.. code-block:: python
-
-   import scSherlock
-   print(scSherlock.__version__)
-
-If this runs without errors, your installation is successful.
+3. For platform-specific issues, check our GitHub issues or create a new one.
