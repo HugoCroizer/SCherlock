@@ -1,5 +1,8 @@
 Installation
 ===========
+.. image:: ../images/logo.png
+   :align: right
+   :width: 150px
 
 This guide covers different methods to install scSherlock, with Conda being the recommended approach.
 

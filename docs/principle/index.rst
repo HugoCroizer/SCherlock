@@ -1,4 +1,10 @@
+
 # SCherlock: A Statistical Method for Identifying Cell Type-Specific Marker Genes from Single-Cell RNA Sequencing Data
+========================
+
+.. image:: ../images/logo.png
+   :align: right
+   :width: 150px
 
 The identification of cell type-specific marker genes is a crucial task in single-cell RNA sequencing (scRNA-seq) analysis. Here, we present SCherlock, a robust statistical approach for identifying marker genes that leverages both theoretical probability distributions and empirical validation through simulation. Our method evaluates gene expression patterns across multiple aggregation levels to identify genes that reliably distinguish target cell types from others. SCherlock incorporates patient-level information to ensure markers are consistent across biological replicates, and employs multiple scoring strategies to optimize for different marker characteristics. We demonstrate that SCherlock efficiently identifies biologically relevant marker genes with high sensitivity and specificity.
 

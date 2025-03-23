@@ -1,6 +1,10 @@
 Tutorials
 =========
 
+.. image:: ../images/logo.png
+   :align: right
+   :width: 150px
+
 Getting Started with scSherlock
 -------------------------------
 
