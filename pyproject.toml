@@ -33,4 +33,4 @@ Documentation = "https://scSherlock.readthedocs.io"
 Repository = "https://github.com/Dantferno/scSherlock"
 
 [tool.setuptools]
-packages = ["scSherlock"]  # Explicitly list only your main package directory
+packages = ["."]  # Explicitly list only your main package directory
