@@ -12,12 +12,17 @@
   
   /* Change link colors */
   a {
-    color: #82b6cd; /* Medium purple for links */
+    color: #82b6cd; 
   }
   
   a:hover {
-    color: #cd8f5a; /* Medium orchid for hover state */
+    color: #cd8f5a;
   }
+
+  a:visited {
+    color: #8d5f3a;
+  }
+
 
   .admonition.note {
     background: #749191; 
