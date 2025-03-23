@@ -4,7 +4,7 @@
 scSherlock - Single-cell data analysis
 =======================================
 
-.. image:: images/logo.png
+.. image:: ../images/logo.png
    :width: 200px
    :align: center
    :alt: scSherlock logo
