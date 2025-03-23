@@ -20,6 +20,10 @@
   }
 
   .admonition.note {
+    background: #5e9e9e; 
+  }
+
+  .admonition-title {
     background: #2f4f4f; 
   }
 
