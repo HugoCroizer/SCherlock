@@ -9,18 +9,11 @@ scSherlock - Single-cell data analysis
    :align: center
    :alt: scSherlock logo
 
-**scSherlock**: A powerful toolkit for discovering cell-cell interactions involved in tissue development.
+**scSherlock**: robust celltype marker identification from scRNAseq data.
 
 .. note::
    This project is under active development.
 
-Main Features
-============
-
-* Analyze single-cell RNA sequencing data
-* Identify and visualize cell-cell interactions
-* Integrate with popular analysis frameworks like scanpy
-* Generate interpretable visualizations of interaction networks
 
 Installation
 ===========
@@ -35,17 +28,42 @@ Quick Start
 ==========
 
 .. code-block:: python
+   
+   import scanpy as sc
+   from scherlock import SCherlock, SCherlockConfig, ScoringMethod
 
-   import scSherlock as scs
-   
    # Load your data
-   adata = scs.read_h5ad("your_data.h5ad")
-   
-   # Run analysis
-   scs.run_analysis(adata)
-   
-   # Visualize results
-   scs.plot_interactions(adata)
+   adata = sc.read("your_data.h5ad")
+
+   # Configure SCherlock
+   config = SCherlockConfig(
+      k_values=[1, 10, 25],              # Cell aggregation levels to evaluate
+      scoring_method=ScoringMethod.DIFF, # Scoring method for marker evaluation
+      max_genes_kept=100,                # Maximum number of genes to keep per cell type
+      min_patients=3,                    # Minimum number of patients expressing the gene
+      min_reads=10,                      # Minimum number of reads for a gene
+      min_cells=10                       # Minimum number of cells expressing the gene
+   )
+
+   # Initialize SCherlock
+   scherlock = SCherlock(
+      adata=adata,
+      column_ctype="cell_type",          # Column in adata.obs for cell type annotations
+      column_patient="patient_id",       # Column in adata.obs for patient IDs
+      config=config
+   )
+
+   # Run the algorithm
+   top_markers = scherlock.run()
+
+   # Export results
+   markers_df = scherlock.export_markers("markers.csv")
+
+   # Visualize top marker
+   scherlock.visualize_marker("TOP_MARKER_GENE")
+
+   # Generate heatmap of markers
+   scherlock.plot_marker_heatmap(n_genes=5)
 
 Contents
 ========
