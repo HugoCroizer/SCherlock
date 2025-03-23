@@ -1,7 +1,7 @@
 .. scSherlock documentation master file
 
 =======================================
-scSherlock - Single-cell data analysis
+scSherlock
 =======================================
 
 .. image:: ../images/logo.png
@@ -9,7 +9,7 @@ scSherlock - Single-cell data analysis
    :align: right
    :alt: scSherlock logo
 
-**scSherlock**: A method for robust celltype marker identification from scRNAseq data.
+**scSherlock** is a robust statistical approach for identifying marker genes that leverages both theoretical probability distributions and empirical validation through simulation. The method evaluates gene expression patterns across multiple aggregation levels to identify genes that reliably distinguish target cell types from others. SCherlock incorporates patient-level information to ensure markers are consistent across biological replicates, and employs multiple scoring strategies to optimize for different marker characteristics. 
 
 .. note::
    This project is under active development.
