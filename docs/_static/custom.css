@@ -1,20 +1,29 @@
 .wy-side-nav-search {
-    background-color: #82b6cd; 
+    background-color: #2f4f4f; 
   }
   
   .wy-nav-top {
-    background-color: #82b6cd; /* Same color for mobile navigation */
+    background-color: #2f4f4f; /* Same color for mobile navigation */
   }
   
   .wy-menu-vertical header, .wy-menu-vertical p.caption {
-    color: #8B008B; /* Change section header colors */
+    color: #cd8f5a; /* Change section header colors */
   }
   
   /* Change link colors */
   a {
-    color: #5e3aa5; /* Medium purple for links */
+    color: #82b6cd; /* Medium purple for links */
   }
   
   a:hover {
-    color: #82b6cd; /* Medium orchid for hover state */
+    color: #cd8f5a; /* Medium orchid for hover state */
+  }
+
+  .admonition-title{
+    background: #2f4f4f; 
+  }
+
+
+  .wy-nav-side{
+    background: #373736; 
   }
