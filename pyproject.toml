@@ -18,13 +18,12 @@ classifiers = [
 ]
 keywords = ["scRNAseq", "Markers"]
 dependencies = [
-    "geopandas",
+    "scanpy",
     "pandas",
     "numpy",
     "matplotlib",
     "plotly",
-    "scipy", 
-    "shapely",
+    "scipy"
 ]
 requires-python = ">=3.8"
 
@@ -34,4 +33,4 @@ Documentation = "https://scSherlock.readthedocs.io"
 Repository = "https://github.com/Dantferno/scSherlock"
 
 [tool.setuptools]
-packages = ["histomap"]  # Explicitly list only your main package directory
+packages = ["scSherlock"]  # Explicitly list only your main package directory
