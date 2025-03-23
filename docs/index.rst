@@ -6,10 +6,10 @@ scSherlock - Single-cell data analysis
 
 .. image:: ../images/logo.png
    :width: 200px
-   :align: center
+   :align: right
    :alt: scSherlock logo
 
-**scSherlock**: robust celltype marker identification from scRNAseq data.
+**scSherlock**: A method for robust celltype marker identification from scRNAseq data.
 
 .. note::
    This project is under active development.
