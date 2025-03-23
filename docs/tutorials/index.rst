@@ -1,7 +1,7 @@
 Tutorials
 =========
 
-.. image:: ../images/logo.png
+.. image:: ./../images/logo.png
    :align: right
    :width: 150px
 

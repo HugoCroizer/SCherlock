@@ -26,8 +26,12 @@
   .admonition-title {
     background: #2f4f4f; 
   }
-
-
+  .admonition.title {
+    background: #2f4f4f; 
+  }
+  .admonition.note.title {
+    background: #2f4f4f; 
+  }
   .wy-nav-side{
     background: #373736; 
   }
