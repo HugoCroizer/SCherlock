@@ -1,20 +1,20 @@
 .wy-side-nav-search {
-    background-color: #4B0082; /* Change this to your preferred color (this is indigo) */
+    background-color: #82b6cd; 
   }
   
   .wy-nav-top {
-    background-color: #4B0082; /* Same color for mobile navigation */
+    background-color: #82b6cd; /* Same color for mobile navigation */
   }
   
   .wy-menu-vertical header, .wy-menu-vertical p.caption {
-    color: #8B008B; /* Change section header colors (this is dark magenta) */
+    color: #8B008B; /* Change section header colors */
   }
   
   /* Change link colors */
   a {
-    color: #9370DB; /* Medium purple for links */
+    color: #5e3aa5; /* Medium purple for links */
   }
   
   a:hover {
-    color: #BA55D3; /* Medium orchid for hover state */
+    color: #82b6cd; /* Medium orchid for hover state */
   }
