@@ -54,7 +54,7 @@ scherlock.plot_marker_heatmap(n_genes=5)
 
 ## Citation
 
-If you use SCherlock in your research, please cite:
+If you use scSherlock in your research, please cite:
 
 ```
 [Citation information will be added here]
