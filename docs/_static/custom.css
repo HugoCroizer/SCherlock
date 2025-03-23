@@ -20,7 +20,7 @@
   }
 
   .admonition.note {
-    background: #5e9e9e; 
+    background: #749191; 
   }
 
   .admonition-title {
@@ -35,3 +35,7 @@
   .wy-nav-side{
     background: #373736; 
   }
+
+.rst-content .note .admonition-title {
+    background-color: #2f4f4f; 
+}
