@@ -62,3 +62,10 @@ intersphinx_mapping = {
 
 # Ignore certain files/patterns
 exclude_patterns = ['_build', '**.ipynb_checkpoints']
+
+html_static_path = ['_static']
+
+# Add custom CSS
+html_css_files = [
+    'custom.css',
+]

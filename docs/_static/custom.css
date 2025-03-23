@@ -1,0 +1,20 @@
+.wy-side-nav-search {
+    background-color: #4B0082; /* Change this to your preferred color (this is indigo) */
+  }
+  
+  .wy-nav-top {
+    background-color: #4B0082; /* Same color for mobile navigation */
+  }
+  
+  .wy-menu-vertical header, .wy-menu-vertical p.caption {
+    color: #8B008B; /* Change section header colors (this is dark magenta) */
+  }
+  
+  /* Change link colors */
+  a {
+    color: #9370DB; /* Medium purple for links */
+  }
+  
+  a:hover {
+    color: #BA55D3; /* Medium orchid for hover state */
+  }
