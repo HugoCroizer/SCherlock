@@ -19,7 +19,7 @@
     color: #cd8f5a; /* Medium orchid for hover state */
   }
 
-  .admonition-title{
+  .admonition.note {
     background: #2f4f4f; 
   }
 
