@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scSherlock"
-version = "0.1.2"
+version = "0.1.0"
 authors = [
   { name="Hugo Croizer" },
 ]
-description = "scSherlock: discovering cell-cell interactions involved in tissue development"
+description = "scSherlock: discovering cell type markers in scRNAseq data."
 readme = "README.md"
 requires-python = ">=3.8"
 classifiers = [
@@ -25,6 +25,7 @@ dependencies = [
     "scikit-learn>=0.24.0",
     "anndata>=0.8.0",
     "scanpy>=1.9.0",
+    "adpbulk"
 ]
 
 [project.urls]

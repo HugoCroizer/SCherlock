@@ -87,7 +87,7 @@ class ScSherlock:
         # Validate inputs
         self._validate_inputs()
         logger.info("Pre-filtering genes...")
-        self.adata = self._prefilter_genes(self.config.min_cells, self.config.min_reads)
+        #self._prefilter_genes(self.config.min_cells, self.config.min_reads)
         # Internal state
         self.cell_types = self.adata.obs[self.column_ctype].unique()
         self.theoretical_scores = None
@@ -129,17 +129,15 @@ class ScSherlock:
         """
         logger.info(f"Original dataset: {self.adata.shape[0]} cells, {self.adata.shape[1]} genes")
         
-        # Create a copy to avoid modifying the original
-        adata_filtered = self.adata.copy()
+    
         
         # Filter genes based on minimum number of cells and counts
-        sc.pp.filter_genes(adata_filtered, min_counts=min_counts)
-        sc.pp.filter_genes(adata_filtered, min_cells=min_cells)
+        sc.pp.filter_genes(self.adata, min_counts=min_counts)
+        sc.pp.filter_genes(self.adata, min_cells=min_cells)
         
-        logger.info(f"Filtered dataset: {adata_filtered.shape[0]} cells, {adata_filtered.shape[1]} genes")
-        logger.info(f"Removed {self.adata.shape[1] - adata_filtered.shape[1]} genes with low expression")
-        
-        return adata_filtered
+        logger.info(f"Filtered dataset: {self.adata.shape[0]} cells, {self.adata.shape[1]} genes")
+        logger.info(f"Removed {self.adata.shape[1] - self.adata.shape[1]} genes with low expression")
+
     
     def run(self, method: str = "empiric") -> Dict[str, str]:
         """
@@ -150,61 +148,97 @@ class ScSherlock:
         """
         if method not in ["theoric", "empiric"]:
             raise ValueError('Method must be either "theoric" or "empiric"')
-    
-        # Set random se
-        # Set random seed for reproducibility
-        np.random.seed(self.config.random_seed)
-        
-        # Step 1: Calculate theoretical scores based on binomial distributions
-        logger.info("Calculating theoretical scores...")
-        self.theoretical_scores, self.expr_proportions = self._calculate_theoretical_scores_parallel()
-        
-        # Step 2: Apply multiple category correction to theoretical scores
-        logger.info("Applying multi-category correction...")
-        self.processed_scores = self._apply_multi_category_correction(self.theoretical_scores)
+        # if theoric model was already run 
+        if self.method_run == None:
+            # Set random se
+            # Set random seed for reproducibility
+            np.random.seed(self.config.random_seed)
+            
+            # Step 1: Calculate theoretical scores based on binomial distributions
+            logger.info("Calculating theoretical scores...")
+            self.theoretical_scores, self.expr_proportions = self._calculate_theoretical_scores_parallel()
+            
+            # Step 2: Apply multiple category correction to theoretical scores
+            logger.info("Applying multi-category correction...")
+            self.processed_scores = self._apply_multi_category_correction(self.theoretical_scores)
 
-        # Step 3: Aggregate scores across k values
-        logger.info("Aggregating scores...")
-        self.aggregated_scores = self._aggregate_scores(self.processed_scores)
+            # Step 3: Aggregate scores across k values
+            logger.info("Aggregating scores...")
+            self.aggregated_scores = self._aggregate_scores(self.processed_scores)
 
-    
-        # Step 4: Sort scores and prepare for filtering
-        logger.info("Sorting scores...")
-        self.sorted_table = self._sort_scores(self.aggregated_scores, self.processed_scores, self.expr_proportions)
         
-        if method == "theoric":
+            # Step 4: Sort scores and prepare for filtering
+            logger.info("Sorting scores...")
+            self.sorted_table = self._sort_scores(self.aggregated_scores, self.processed_scores, self.expr_proportions)
+            
+            if method == "theoric":
+                logger.info("Identifying top markers...")
+                self.top_markers = self._construct_top_marker_list(self.sorted_table)
+                self.method_run = "theoric"
+                return self.top_markers
+
+            # Step 5: Filter genes based on scores and expression criteria
+            logger.info("Filtering genes...")
+            self.filtered_scores = self._filter_genes(self.sorted_table)
+
+            # Step 6: Calculate empirical scores through simulation
+            logger.info("Calculating empirical scores...")
+            #self.empirical_scores = self._calculate_empirical_scores(self.filtered_scores)
+            self.empirical_scores = self.empirical_scores_v0_optimized(self.filtered_scores)
+
+            # Step 7: Aggregate empirical scores across k values
+            logger.info("Aggregating empirical scores...")
+            self.aggregated_empirical_scores = self._aggregate_scores(self.empirical_scores)
+
+            # Step 8: Sort empirical scores
+            logger.info("Sorting empirical scores...")
+            self.sorted_empirical_table = self._sort_scores(
+                self.aggregated_empirical_scores, 
+                self.empirical_scores, 
+                self.expr_proportions
+            )
+            # Step 9: Construct final list of top markers
             logger.info("Identifying top markers...")
-            self.top_markers = self._construct_top_marker_list(self.sorted_table)
-            self.method_run = "theoric"
+            self.top_markers = self._construct_top_marker_list(self.sorted_empirical_table)
+            self.method_run = "empiric"
+
+            logger.info(f"ScSherlock completed. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
             return self.top_markers
+        elif self.method_run == 'theoric':
+            if method == "theoric":
+                logger.info(f"ScSherlock already run with theoric method. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
+                return self.top_markers
+            else:       
+                logger.info(f"Skipping theorical model as it was already run. Running empiric model")
+                # Step 5: Filter genes based on scores and expression criteria
+                logger.info("Filtering genes...")
+                self.filtered_scores = self._filter_genes(self.sorted_table)
 
-        # Step 5: Filter genes based on scores and expression criteria
-        logger.info("Filtering genes...")
-        self.filtered_scores = self._filter_genes(self.sorted_table)
+                # Step 6: Calculate empirical scores through simulation
+                logger.info("Calculating empirical scores...")
+                #self.empirical_scores = self._calculate_empirical_scores(self.filtered_scores)
+                self.empirical_scores = self.empirical_scores_v0_optimized(self.filtered_scores)
 
-        # Step 6: Calculate empirical scores through simulation
-        logger.info("Calculating empirical scores...")
-        #self.empirical_scores = self._calculate_empirical_scores(self.filtered_scores)
-        self.empirical_scores = self.empirical_scores_v0_optimized(self.filtered_scores)
+                # Step 7: Aggregate empirical scores across k values
+                logger.info("Aggregating empirical scores...")
+                self.aggregated_empirical_scores = self._aggregate_scores(self.empirical_scores)
 
-        # Step 7: Aggregate empirical scores across k values
-        logger.info("Aggregating empirical scores...")
-        self.aggregated_empirical_scores = self._aggregate_scores(self.empirical_scores)
+                # Step 8: Sort empirical scores
+                logger.info("Sorting empirical scores...")
+                self.sorted_empirical_table = self._sort_scores(
+                    self.aggregated_empirical_scores, 
+                    self.empirical_scores, 
+                    self.expr_proportions
+                )
+                # Step 9: Construct final list of top markers
+                logger.info("Identifying top markers...")
+                self.top_markers = self._construct_top_marker_list(self.sorted_empirical_table)
+                self.method_run = "empiric"
 
-        # Step 8: Sort empirical scores
-        logger.info("Sorting empirical scores...")
-        self.sorted_empirical_table = self._sort_scores(
-            self.aggregated_empirical_scores, 
-            self.empirical_scores, 
-            self.expr_proportions
-        )
-        # Step 9: Construct final list of top markers
-        logger.info("Identifying top markers...")
-        self.top_markers = self._construct_top_marker_list(self.sorted_empirical_table)
-        self.method_run = "empiric"
-
-        logger.info(f"ScSherlock completed. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
-        return self.top_markers
+                logger.info(f"ScSherlock completed. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
+                return self.top_markers
+        else:
+            logger.info(f"ScSherlock already run with empiric method. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
     
     def _calculate_theoretical_scores_optimized(self) -> Tuple[Dict, Dict]:
         """
@@ -1365,13 +1399,11 @@ class ScSherlock:
             Dict[str, str]: Dictionary mapping cell types to top marker genes
         """
         # Get top scoring marker for each cell type that meets the cutoff
-        print(sorted_emp_table)
         top_markers = {
             ctype: table.index[0]  # First gene is highest scoring
             for ctype, table in sorted_emp_table.items()
             if not table.empty and table['aggregated'].max() >= self.config.score_cutoff
         }
-        print(top_markers)
         return top_markers
     
     def visualize_marker(self, gene: str, cell_type: str = None):
@@ -1570,7 +1602,7 @@ class ScSherlock:
         
         # Filter adata to only include cell types that have markers
         mask = self.adata.obs[groupby].isin(cell_to_genes.keys())
-        adata_filtered = self.adata[mask].copy()
+        adata_filtered = self.adata[mask]
         
         if adata_filtered.n_obs == 0:
             raise ValueError(f"No cells found for the given cell types in {groupby}")
