@@ -17,10 +17,10 @@ These tutorials guide you through the process of identifying marker genes with s
    :maxdepth: 1
    :caption: Tutorial Notebooks:
 
-   tutorials/1_Basic_usage.ipynb
-   tutorials/2_Multiple_datasets.ipynb
-   tutorials/3_Multiple_annotations.ipynb
-   tutorials/4_Unsupervised_marker_identification.ipynb
+   ./1_Basic_usage.ipynb
+   ./2_Multiple_datasets.ipynb
+   ./3_Multiple_annotations.ipynb
+   ./4_Unsupervised_marker_identification.ipynb
 
 Getting Help
 -----------
