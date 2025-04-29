@@ -1,10 +1,6 @@
 ===============================================================================
-SCherlock: A Statistical Method for Identifying Cell Type-Specific Marker Genes
+SCherlock method
 ===============================================================================
-
-.. image:: ../images/logo.png
-   :align: right
-   :width: 150px
 
 Overview
 ========

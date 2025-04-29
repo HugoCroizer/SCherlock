@@ -8,9 +8,16 @@ from scipy.stats import binom, percentileofscore
 from adpbulk import ADPBulk
 import logging
 from dataclasses import dataclass
-from enum import Enum, auto
-import time
+from enum import Enum
 from joblib import Parallel, delayed
+import scipy
+import numba as nb
+from sklearn.preprocessing import StandardScaler
+from statsmodels.distributions.empirical_distribution import ECDF
+import gc
+import networkx as nx
+from networkx.drawing.nx_agraph import graphviz_layout
+from collections import defaultdict
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
@@ -82,6 +89,7 @@ class ScSherlock:
         self.adata = adata
         self.column_ctype = column_ctype
         self.column_patient = column_patient
+        self.column_patient = self.simplify_patient_ids()
         self.config = config or ScSherlockConfig()
         
         # Validate inputs
@@ -138,6 +146,37 @@ class ScSherlock:
         logger.info(f"Filtered dataset: {self.adata.shape[0]} cells, {self.adata.shape[1]} genes")
         logger.info(f"Removed {self.adata.shape[1] - self.adata.shape[1]} genes with low expression")
 
+    def simplify_patient_ids(self, prefix="P"):
+        """
+        Create a simplified mapping of patient IDs and update the patient column reference.
+        
+        This method creates a new column in adata.obs with simplified patient IDs
+        (e.g., P1, P2, ..., PN) to avoid issues with complex patient identifiers.
+        
+        Args:
+            prefix (str): Prefix to use for simplified patient IDs (default: "P")
+            
+        Returns:
+            str: The name of the new simplified patient column
+        """
+        # Create a mapping from original patient IDs to simplified ones
+        unique_patients = self.adata.obs[self.column_patient].unique()
+        patient_mapping = {patient: f"{prefix}{i+1}" for i, patient in enumerate(unique_patients)}
+        
+        # Create a new column name for the simplified IDs
+        simplified_column = f"{self.column_patient}_simplified"
+        
+        # Add the new column to the AnnData object
+        self.adata.obs[simplified_column] = self.adata.obs[self.column_patient].map(patient_mapping)
+        
+        # Store the original column name and update the reference
+        self.original_patient_column = self.column_patient
+        self.column_patient = simplified_column
+        
+        logger.info(f"Created simplified patient IDs in column '{simplified_column}'")
+        logger.info(f"Patient column reference updated from '{self.original_patient_column}' to '{self.column_patient}'")
+        
+        return simplified_column
     
     def run(self, method: str = "empiric") -> Dict[str, str]:
         """
@@ -184,9 +223,9 @@ class ScSherlock:
             # Step 6: Calculate empirical scores through simulation
             logger.info("Calculating empirical scores...")
             #self.empirical_scores = self._calculate_empirical_scores(self.filtered_scores)
-            self.empirical_scores = self.empirical_scores_v0_optimized(self.filtered_scores)
-
-            # Step 7: Aggregate empirical scores across k values
+            self.empirical_scores = self.empirical_scores_optimized_batch_parallel_only_ctype()
+            
+             # Step 7: Aggregate empirical scores across k values
             logger.info("Aggregating empirical scores...")
             self.aggregated_empirical_scores = self._aggregate_scores(self.empirical_scores)
 
@@ -204,6 +243,7 @@ class ScSherlock:
 
             logger.info(f"ScSherlock completed. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
             return self.top_markers
+        
         elif self.method_run == 'theoric':
             if method == "theoric":
                 logger.info(f"ScSherlock already run with theoric method. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
@@ -217,7 +257,7 @@ class ScSherlock:
                 # Step 6: Calculate empirical scores through simulation
                 logger.info("Calculating empirical scores...")
                 #self.empirical_scores = self._calculate_empirical_scores(self.filtered_scores)
-                self.empirical_scores = self.empirical_scores_v0_optimized(self.filtered_scores)
+                self.empirical_scores = self.empirical_scores_optimized_batch_parallel_only_ctype(self.filtered_scores)
 
                 # Step 7: Aggregate empirical scores across k values
                 logger.info("Aggregating empirical scores...")
@@ -240,265 +280,6 @@ class ScSherlock:
         else:
             logger.info(f"ScSherlock already run with empiric method. Found markers for {len(self.top_markers)}/{len(self.cell_types)} cell types")
     
-    def _calculate_theoretical_scores_optimized(self) -> Tuple[Dict, Dict]:
-        """
-        Calculate theoretical scores based on binomial distribution with optimization
-        
-        Returns:
-            Tuple[Dict, Dict]: Scores and expression proportions
-        """
-        # Sparse sampling parameters
-        sparse_step = 10
-        promising_threshold = 0.1
-
-        # Estimate binomial distribution parameters
-        parameters = self._estimate_binomial_parameters()
-
-        scores = {}
-        # Calculate scores for each cell type
-        for ctype in self.cell_types:
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = pd.DataFrame(
-                np.zeros((self.adata.shape[1], len(self.config.k_values))),
-                index=self.adata.var.index, 
-                columns=self.config.k_values
-            )
-            
-            # Calculate scores for each k value
-            for k in self.config.k_values:
-                # Calculate cutoffs for computation
-                cutoffs_k = pd.DataFrame([
-                    # Target cells
-                    binom.ppf(.99, int(parameters[0][ctype] * k), parameters[2][ctype]),
-                    # Non-target cells
-                    binom.ppf(.99, int(parameters[1][ctype] * k), parameters[3][ctype])
-                ], columns=scores_ctype.index).max().clip(lower=100)
-                
-                # Determine the cutoff value
-                cutoff_k = int(cutoffs_k.max())
-                
-                # OPTIMIZATION: Start with sparse sampling
-                sparse_points = np.arange(0, cutoff_k, sparse_step)
-                if len(sparse_points) == 0:  # Ensure at least one point
-                    sparse_points = np.array([0])
-                
-                # Initialize arrays for sparse CDFs
-                alpha_sparse = np.zeros(shape=(self.adata.shape[1], len(sparse_points)))
-                beta_sparse = np.zeros(shape=(self.adata.shape[1], len(sparse_points)))
-                
-                # Calculate sparse CDFs using binomial CDF
-                for i, l in enumerate(sparse_points):
-                    alpha_sparse[:, i] = binom.cdf(
-                        l, int(parameters[0][ctype] * k), parameters[2][ctype]
-                    )
-                    beta_sparse[:, i] = binom.cdf(
-                        l, int(parameters[1][ctype] * k), parameters[3][ctype]
-                    )
-                
-                # Identify promising genes based on scoring method
-                promising_genes = np.ones(self.adata.shape[1], dtype=bool)  # Default all genes to promising
-                
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    # Max difference between specificity (beta) and false negative rate (alpha)
-                    sparse_diff = beta_sparse - alpha_sparse
-                    max_sparse_diff = np.max(sparse_diff, axis=1)
-                    promising_genes = max_sparse_diff > promising_threshold
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # Sensitivity at point of zero false positive rate
-                    max_beta = np.max(beta_sparse, axis=1)
-                    promising_genes = max_beta > (1 - promising_threshold)
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # PPV calculation for sparse points
-                    ppv_sparse = np.nan_to_num((1-alpha_sparse)/(2-alpha_sparse-beta_sparse))
-                    # Check if any value exceeds 0.99
-                    promising_genes = np.max(ppv_sparse > 0.99, axis=1) > 0
-                
-                # Initialize full arrays for alpha and beta
-                alpha = np.zeros(shape=(self.adata.shape[1], cutoff_k))
-                beta = np.zeros(shape=(self.adata.shape[1], cutoff_k))
-                
-                # Copy sparse results into the full arrays to avoid recalculation
-                for i, l in enumerate(sparse_points):
-                    alpha[:, l] = alpha_sparse[:, i]
-                    beta[:, l] = beta_sparse[:, i]
-                
-                # Calculate remaining points only for promising genes
-                remaining_points = np.setdiff1d(np.arange(cutoff_k), sparse_points)
-                
-                for l in remaining_points:
-                    # Calculate alpha, but only for promising genes
-                    if np.any(promising_genes):
-                        if promising_genes.all():  # If all genes are promising, calculate for all
-                            alpha[:, l] = binom.cdf(l, int(parameters[0][ctype] * k), parameters[2][ctype])
-                            beta[:, l] = binom.cdf(l, int(parameters[1][ctype] * k), parameters[3][ctype])
-                        else:
-                            # Get indices of promising genes
-                            promising_indices = np.where(promising_genes)[0]
-                            
-                            # Calculate for promising genes only
-                            alpha[promising_indices, l] = binom.cdf(
-                                l, 
-                                int(parameters[0][ctype] * k), 
-                                parameters[2][ctype][promising_indices]
-                            )
-                            beta[promising_indices, l] = binom.cdf(
-                                l, 
-                                int(parameters[1][ctype] * k), 
-                                parameters[3][ctype][promising_indices]
-                            )
-                
-                # Calculate scores based on the scoring method
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    # Max difference between specificity (beta) and false negative rate (alpha)
-                    scores_ctype[k] = (beta-alpha)[np.arange(self.adata.shape[1]), np.argmax(beta-alpha, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # Sensitivity at point of zero false positive rate
-                    scores_ctype[k] = (1-alpha)[np.arange(self.adata.shape[1]), np.argmax(beta, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # Positive predictive value calculation
-                    ppv = np.nan_to_num((1-alpha)/(2-alpha-beta))
-                    # Sensitivity at point where PPV > 99%
-                    scores_ctype[k] = ((1-alpha)[np.arange(self.adata.shape[1]), 
-                                        np.argmax(ppv>0.99, axis=1)]) * (np.sum(ppv>0.99, axis=1)>0)
-            
-            scores[ctype] = scores_ctype
-        
-        return scores, parameters[2]
-        
-    def _calculate_theoretical_scores_parallel(self) -> Tuple[Dict, Dict]:
-        """
-        Calculate theoretical scores using joblib for parallelization
-        
-        Returns:
-            Tuple[Dict, Dict]: Scores and expression proportions
-        """
-        from joblib import Parallel, delayed
-        
-        # Estimate binomial distribution parameters
-        parameters = self._estimate_binomial_parameters()
-        
-        def process_cell_type(ctype):
-            """Process a single cell type"""
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = pd.DataFrame(
-                np.zeros((self.adata.shape[1], len(self.config.k_values))),
-                index=self.adata.var.index,
-                columns=self.config.k_values
-            )
-            
-            # Calculate scores for each k value
-            for k in self.config.k_values:
-                # Calculate cutoffs for computation
-                cutoffs_k = pd.DataFrame([
-                    # Target cells
-                    binom.ppf(.99, int(parameters[0][ctype] * k), parameters[2][ctype]),
-                    # Non-target cells
-                    binom.ppf(.99, int(parameters[1][ctype] * k), parameters[3][ctype])
-                ], columns=scores_ctype.index).max().clip(lower=100)
-                
-                # Calculate alpha (CDF for target) and beta (CDF for non-target)
-                alpha = (cutoffs_k.values[:, None] * np.arange(101) // 100)
-                beta = alpha.copy()
-                
-                # Calculate CDFs
-                for l in np.arange(101):
-                    alpha[:, l] = binom.cdf(alpha[:, l], int(parameters[0][ctype] * k), parameters[2][ctype])
-                    beta[:, l] = binom.cdf(beta[:, l], int(parameters[1][ctype] * k), parameters[3][ctype])
-                
-                # Compute scores based on scoring method
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    # Max difference between sensitivity and FPR
-                    scores_ctype[k] = (beta - alpha)[np.arange(self.adata.shape[1]), np.argmax(beta - alpha, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # Sensitivity at zero FPR
-                    scores_ctype[k] = (1 - alpha)[np.arange(self.adata.shape[1]), np.argmax(beta, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # Sensitivity at PPV > 99%
-                    ppv = np.nan_to_num((1 - alpha) / (2 - alpha - beta))
-                    scores_ctype[k] = (
-                        (1 - alpha)[np.arange(self.adata.shape[1]), np.argmax(ppv > 0.99, axis=1)] *
-                        (np.sum(ppv > 0.99, axis=1) > 0)
-                    )
-            
-            return ctype, scores_ctype
-        
-        # Determine number of jobs (cores)
-        n_jobs = self.config.n_jobs  
-        
-        # Process in parallel
-        logger.info(f"Starting parallel processing with joblib")
-        results = Parallel(n_jobs=n_jobs)(
-            delayed(process_cell_type)(ctype) for ctype in self.cell_types
-        )
-        
-        # Collect results
-        scores = {ctype: score for ctype, score in results}
-        
-        return scores, parameters[2]
-
-
-    def _calculate_theoretical_scores(self) -> Tuple[Dict, Dict]:
-        """
-        Calculate theoretical scores based on binomial distribution
-        
-        Returns:
-            Tuple[Dict, Dict]: Scores and expression proportions
-        """
-        # Estimate binomial distribution parameters
-        parameters = self._estimate_binomial_parameters()
-
-        scores = {}
-        # Calculate scores for each cell type
-        for ctype in self.cell_types:
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = pd.DataFrame(
-                np.zeros((self.adata.shape[1], len(self.config.k_values))),
-                index=self.adata.var.index, 
-                columns=self.config.k_values
-            )
-            
-            # Calculate scores for each k value
-            for k in self.config.k_values:
-                # Calculate cutoffs for computation
-                cutoffs_k = pd.DataFrame([
-                    # Target cells
-                    binom.ppf(.99, int(parameters[0][ctype] * k), parameters[2][ctype]),
-                    # Non-target cells
-                    binom.ppf(.99, int(parameters[1][ctype] * k), parameters[3][ctype])
-                ], columns=scores_ctype.index).max().clip(lower=100)
-                
-                # Calculate alpha (CDF for target) and beta (CDF for non-target)
-                alpha = (cutoffs_k.values[:, None] * np.arange(101) // 100)
-                beta = alpha.copy()
-                
-                # Calculate CDFs
-                for l in np.arange(101):
-                    alpha[:, l] = binom.cdf(alpha[:, l], int(parameters[0][ctype] * k), parameters[2][ctype])
-                    beta[:, l] = binom.cdf(beta[:, l], int(parameters[1][ctype] * k), parameters[3][ctype])
-                
-                # Compute scores based on scoring method
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    # Max difference between sensitivity and FPR
-                    scores_ctype[k] = (beta - alpha)[np.arange(self.adata.shape[1]), np.argmax(beta - alpha, axis=1)]
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # Sensitivity at zero FPR
-                    scores_ctype[k] = (1 - alpha)[np.arange(self.adata.shape[1]), np.argmax(beta, axis=1)]
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # Sensitivity at PPV > 99%
-                    ppv = np.nan_to_num((1 - alpha) / (2 - alpha - beta))
-                    scores_ctype[k] = (
-                        (1 - alpha)[np.arange(self.adata.shape[1]), np.argmax(ppv > 0.99, axis=1)] *
-                        (np.sum(ppv > 0.99, axis=1) > 0)
-                    )
-            
-            scores[ctype] = scores_ctype
-            
-        return scores, parameters[2]
-
 
     def _estimate_binomial_parameters(self) -> Tuple[pd.Series, pd.Series, pd.DataFrame, pd.DataFrame]:
         """
@@ -725,646 +506,323 @@ class ScSherlock:
             
         return filtered_scores
     
-
     
-    def empirical_cdf_v0(self, df, value):
-        #empirical cdf computation (all genes must be evaluated on the same number of pointd)
-        return df.apply(lambda col: percentileofscore(col, value, kind='rank') / 100)
-    
-    def empirical_scores_v0_optimized_parallel_v2(self, filtered_scores):
-        """
-        Calculate empirical marker gene scores through simulation with sparse sampling optimization,
-        using parallel processing for improved performance.
-        
-        Args:
-            filtered_scores: Dictionary of filtered scores by cell type
+    def empirical_scores_optimized_batch_parallel_only_ctype(self, n_sim=1000):
+            """
+            Calculate empirical marker gene scores through simulation using optimized statistical libraries
+            with parallel processing only on cell types.
+            
+            Args:
+                n_sim: Number of simulations to run (default: 1000)
+                    
+            Returns:
+                Dictionary of empirical scores by cell type
+            """
+            # Get instance variables
+            filtered_scores = self.filtered_scores
+            adata = self.adata
+            column_ctype = self.column_ctype
+            column_patient = self.column_patient
+            k_values = self.config.k_values
+            scoring = self.config.scoring_method
+            seed = 42
+            n_jobs=self.config.n_jobs
+            
+            # Set random seed for reproducibility
+            np.random.seed(seed)
+            
+            # Get all unique cell types
+            cell_types = adata.obs[column_ctype].unique()
+            
+            # Collect all genes from filtered_scores across all cell types
+            all_genes = []
+            for ctype in cell_types:
+                if not filtered_scores[ctype].empty:
+                    all_genes.extend(filtered_scores[ctype].index.tolist())
+            all_genes = list(set(all_genes))  # Remove duplicates
+            
+            # Create gene index mapping (gene_name -> position in adata.var_names)
+            gene_indices = {gene: i for i, gene in enumerate(adata.var_names) if gene in all_genes}
+            gene_names = list(gene_indices.keys())
+            
+            # Dictionary to store scores for all cell types
+            scores_all = {}
+            
+            # Determine if data is sparse
+            is_sparse = scipy.sparse.issparse(adata.X)
+            
+            # Define a worker function to parallelize the cell type processing
+            def process_cell_type(ctype):
+                # Skip cell types with no filtered genes
+                if filtered_scores[ctype].empty:
+                    return ctype, pd.DataFrame([])
+                    
+                # Initialize score matrix (rows=genes, columns=k_values)
+                scores_ctype = pd.DataFrame(np.zeros((len(gene_names), len(k_values))), 
+                                        index=gene_names, columns=k_values)
                 
+                # Get indices of target and non-target cells
+                target_indices = np.where(adata.obs[column_ctype] == ctype)[0]
+                nontarget_indices = np.where(adata.obs[column_ctype] != ctype)[0]
+                
+                # Get the gene indices as a list for easier slicing
+                gene_idx_list = [gene_indices[gene] for gene in gene_names]
+                
+                # Process k values sequentially
+                for k_idx, k in enumerate(k_values):
+                    # Initialize arrays for expression sums
+                    target_sums = np.zeros((n_sim, len(gene_names)))
+                    nontarget_sums = np.zeros((n_sim, len(gene_names)))
+                    
+                    # Process in manageable batches to reduce memory usage
+                    batch_size = min(100, n_sim)  # Adjust based on available memory
+                    
+                    # Create a local random state for thread safety
+                    local_random = np.random.RandomState(seed + k_idx)
+                    
+                    # Calculate batch counts and indices
+                    if k > 1:
+                        for batch_start in range(0, n_sim, batch_size):
+                            batch_end = min(batch_start + batch_size, n_sim)
+                            
+                            # Sample k target cells for each simulation in this batch
+                            for sim_idx in range(batch_start, batch_end):
+                                # Sample k cells for this simulation
+                                sampled_cells = local_random.choice(target_indices, k, replace=True)
+                                
+                                # Extract and sum expression for these cells
+                                for cell_idx in sampled_cells:
+                                    if is_sparse:
+                                        expr = adata.X[cell_idx, gene_idx_list].toarray().flatten()
+                                    else:
+                                        expr = adata.X[cell_idx, gene_idx_list]
+                                    target_sums[sim_idx] += expr
+                            
+                            # Sample k non-target cells for each simulation in this batch
+                            for sim_idx in range(batch_start, batch_end):
+                                # Sample k cells for this simulation
+                                sampled_cells = local_random.choice(nontarget_indices, k, replace=True)
+                                
+                                # Extract and sum expression for these cells
+                                for cell_idx in sampled_cells:
+                                    if is_sparse:
+                                        expr = adata.X[cell_idx, gene_idx_list].toarray().flatten()
+                                    else:
+                                        expr = adata.X[cell_idx, gene_idx_list]
+                                    nontarget_sums[sim_idx] += expr
+                    else:  # k == 1
+                        for batch_start in range(0, n_sim, batch_size):
+                            batch_end = min(batch_start + batch_size, n_sim)
+                            
+                            # Sample target cells for each simulation in this batch
+                            for sim_idx in range(batch_start, batch_end):
+                                # Sample 1 cell for this simulation
+                                cell_idx = local_random.choice(target_indices)
+                                
+                                # Extract expression for this cell
+                                if is_sparse:
+                                    target_sums[sim_idx] = adata.X[cell_idx, gene_idx_list].toarray().flatten()
+                                else:
+                                    target_sums[sim_idx] = adata.X[cell_idx, gene_idx_list]
+                            
+                            # Sample non-target cells for each simulation in this batch
+                            for sim_idx in range(batch_start, batch_end):
+                                # Sample 1 cell for this simulation
+                                cell_idx = local_random.choice(nontarget_indices)
+                                
+                                # Extract expression for this cell
+                                if is_sparse:
+                                    nontarget_sums[sim_idx] = adata.X[cell_idx, gene_idx_list].toarray().flatten()
+                                else:
+                                    nontarget_sums[sim_idx] = adata.X[cell_idx, gene_idx_list]
+                    
+                    # Determine cutoff value for CDF calculation (99th percentile of the largest gene)
+                    cutoff_k = int(max(
+                        np.percentile(target_sums, 99, axis=0).max(),
+                        np.percentile(nontarget_sums, 99, axis=0).max(),
+                        1
+                    ))
+                    
+                    # Calculate alpha and beta matrices using vectorized operations
+                    alpha = np.zeros((len(gene_names), cutoff_k))
+                    beta = np.zeros((len(gene_names), cutoff_k))
+                    
+                    # Use statsmodels ECDF for faster CDF computation
+                    for g in range(len(gene_names)):
+                        # Get expression values for current gene
+                        target_expr = target_sums[:, g]
+                        nontarget_expr = nontarget_sums[:, g]
+                        
+                        # Compute ECDFs
+                        ecdf_target = ECDF(target_expr)
+                        ecdf_nontarget = ECDF(nontarget_expr)
+                        
+                        # Evaluate at each threshold level
+                        thresholds = np.arange(cutoff_k)
+                        alpha[g, :] = ecdf_target(thresholds)
+                        beta[g, :] = ecdf_nontarget(thresholds)
+
+
+                    
+                    # Calculate scores based on specified scoring method
+                    if scoring == ScoringMethod.DIFF:
+                        scores = compute_diff_scores(alpha, beta)
+                    elif scoring == ScoringMethod.SENS_FPR_ZERO:
+                        scores = compute_sensFPRzero_scores(alpha, beta)
+                    elif scoring == ScoringMethod.SENS_PPV_99:
+                        scores = compute_sensPPV99_scores(alpha, beta)
+                        
+                    # Assign scores to the dataframe
+                    scores_ctype.iloc[:, k_idx] = scores
+                gc.collect()
+                return ctype, scores_ctype
+            
+            # Process cell types in parallel
+            results = Parallel(n_jobs=n_jobs, verbose=False)(
+                delayed(process_cell_type)(ctype)
+                for ctype in cell_types
+            )
+            
+            # Collect results
+            for ctype, scores_ctype in results:
+                scores_all[ctype] = scores_ctype
+            
+            # Apply multi-category correction to normalize scores
+            corr_scores = self.multi_cat_correction_for_optimized(scores_all)
+            
+            # Filter scores to include only genes from filtered_scores
+            scores = {}
+            for ctype in cell_types:
+                if filtered_scores[ctype].empty:
+                    scores[ctype] = pd.DataFrame([])
+                else:
+                    # Extract scores for filtered genes and clip values to max of 1
+                    genes_to_keep = filtered_scores[ctype].index
+                    scores[ctype] = corr_scores[ctype].loc[genes_to_keep].clip(upper=1)
+            
+            return scores
+    
+    def _calculate_theoretical_scores_parallel(self) -> Tuple[Dict, Dict]:
+        """
+        Calculate theoretical scores using joblib for parallelization with reduced memory footprint
+        
         Returns:
-            Dictionary of empirical scores by cell type
+            Tuple[Dict, Dict]: Scores and expression proportions
         """
         from joblib import Parallel, delayed
-        import time
+        import gc
         
-        start_time = time.time()
-        logger.info("Starting parallel empirical score calculation")
+        # Estimate binomial distribution parameters
+        parameters = self._estimate_binomial_parameters()
         
-        # Initialize an empty list to collect genes of interest
-        gene_list = []
-        
-        # Set random seed for reproducibility
-        np.random.seed(self.config.random_seed)
-        
-        # Collect all genes from filtered_scores across all cell types
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            if not filtered_scores[ctype].empty:
-                gene_list += filtered_scores[ctype].index.tolist()
-        
-        # Remove duplicates while preserving order
-        gene_list = list(dict.fromkeys(gene_list))
-        logger.info(f"Computing empirical scores for {len(gene_list)} genes")
-        
-        # subset  the AnnData object containing only genes of interest
-        self.adata = self.adata[:, gene_list]
-        
-        # Define a function to process a single cell type
         def process_cell_type(ctype):
-            logger.debug(f"Processing empirical scores for cell type: {ctype}")
-            cell_start_time = time.time()
+            """Process a single cell type"""
+            # Extract only what we need from parameters to avoid reference to large objects
+            param0_ctype = int(parameters[0][ctype])
+            param1_ctype = int(parameters[1][ctype]) 
+            param2_ctype = parameters[2][ctype]
+            param3_ctype = parameters[3][ctype]
             
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = np.zeros(shape=(self.adata.shape[1], len(self.config.k_values)))
-            scores_ctype = pd.DataFrame(scores_ctype, index=self.adata.var.index, columns=self.config.k_values)
+            # Get gene names once to avoid copying self.adata.var.index multiple times
+            gene_names = list(self.adata.var.index)
+            k_values = list(self.config.k_values)
+            n_genes = len(gene_names)
+            scoring_method = self.config.scoring_method  # Store locally to avoid referencing self
             
-            
-            
+            # Initialize score matrix using numpy for better memory efficiency
+            scores_np = np.zeros((n_genes, len(k_values)))
             
             # Calculate scores for each k value
-            for k in self.config.k_values:
-                if k > 1:
-                    # Extract expression data for target and non-target cells
-                    expr_A = sc.get.obs_df(self.adata[self.adata.obs[self.column_ctype]==ctype], 
-                                self.adata.var.index.tolist())
-                    # Sample k cells from target population n_sim times
-                    sampled_A = np.random.choice(expr_A.shape[0], (self.config.n_simulations, k), replace=True)
-                    k_sums_A = pd.DataFrame(expr_A.values[sampled_A].sum(axis=1), columns=expr_A.columns)
-                    del expr_A
+            for k_idx, k in enumerate(k_values):
+                # Calculate cutoffs for computation
+                
+                # Compute probability values directly to avoid large DataFrame creation
+                cutoffs_k = np.maximum(
+                    binom.ppf(.99, param0_ctype * k, param2_ctype),
+                    binom.ppf(.99, param1_ctype * k, param3_ctype)
+                )
+                cutoffs_k = np.clip(cutoffs_k, a_min=100, a_max=None)
+                
+                # Create alpha and beta arrays with minimal size
+                max_cutoff = int(np.max(cutoffs_k))
+                n_points = min(101, max_cutoff)  # Limit to reduce memory usage
+                alpha = np.zeros((n_genes, n_points))
+                beta = np.zeros((n_genes, n_points))
+                
+                # Calculate CDFs for evenly spaced points
+                threshold_points = np.linspace(0, max_cutoff, n_points).astype(int)
+                for i, l in enumerate(threshold_points):
+                    alpha[:, i] = binom.cdf(l, param0_ctype * k, param2_ctype)
+                    beta[:, i] = binom.cdf(l, param1_ctype * k, param3_ctype)
+                
+                # Compute scores based on scoring method
+                if scoring_method == ScoringMethod.DIFF:
+                    # Max difference between sensitivity and FPR
+                    diff = beta - alpha
+                    max_indices = np.argmax(diff, axis=1)
+                    for i in range(n_genes):
+                        scores_np[i, k_idx] = diff[i, max_indices[i]]
+                        
+                elif scoring_method == ScoringMethod.SENS_FPR_ZERO:
+                    # Sensitivity at zero FPR
+                    max_indices = np.argmax(beta, axis=1)
+                    for i in range(n_genes):
+                        scores_np[i, k_idx] = 1 - alpha[i, max_indices[i]]
+                        
+                elif scoring_method == ScoringMethod.SENS_PPV_99:
+                    # Sensitivity at PPV > 99%
+                    for i in range(n_genes):
+                        ppv = np.nan_to_num((1 - alpha[i]) / (2 - alpha[i] - beta[i]))
+                        ppv_exceeds = ppv > 0.99
+                        if np.any(ppv_exceeds):
+                            first_idx = np.argmax(ppv_exceeds)
+                            scores_np[i, k_idx] = 1 - alpha[i, first_idx]
+                
+                # Delete intermediate arrays to free memory
+                del alpha, beta, cutoffs_k
+            
+            # Convert to DataFrame only at the end
+            scores_ctype = pd.DataFrame(
+                scores_np,
+                index=gene_names, 
+                columns=k_values
+            )
+            
+            # Force garbage collection before returning
+            gc.collect()
+            return ctype, scores_ctype
+        
+        # Process cell types in batches to reduce peak memory usage
+        batch_size = self.config.batch_size
+        all_cell_types = list(self.cell_types)
+        n_jobs = min(self.config.n_jobs, batch_size)  # Limit jobs per batch
+        
+        scores = {}
+        for batch_start in range(0, len(all_cell_types), batch_size):
+            batch_end = min(batch_start + batch_size, len(all_cell_types))
+            current_batch = all_cell_types[batch_start:batch_end]
+            
+            #logger.info(f"Processing batch of {len(current_batch)} cell types with {n_jobs} workers")
+            
+            # Use memory-efficient options in Parallel
+            batch_results = Parallel(
+                n_jobs=n_jobs, 
+                max_nbytes='50M',  # Limit memory per job
+                prefer="threads",   # Use threads for better memory sharing
+                verbose=False          # Show progress
+            )(delayed(process_cell_type)(ctype) for ctype in current_batch)
+            
+            # Add batch results to scores dictionary
+            for ctype, score in batch_results:
+                scores[ctype] = score
+            
+            # Clean up batch results to free memory
+            del batch_results
+            gc.collect()
+        
+        logger.info("Completed theoretical score calculation")
+        return scores, parameters[2]
 
-                    # Sample k cells from non-target population n_sim times
-                    expr_nA = sc.get.obs_df(self.adata[self.adata.obs[self.column_ctype]!=ctype], 
-                                self.adata.var.index.tolist())
-                    sampled_nA = np.random.choice(expr_nA.shape[0], (self.config.n_simulations, k), replace=True)
-                    k_sums_nA = pd.DataFrame(expr_nA.values[sampled_nA].sum(axis=1), columns=expr_nA.columns)
-                    del expr_nA
-                else:
-                    # For k=1, no aggregation needed, use raw expression values
-                    k_sums_A = sc.get.obs_df(self.adata[self.adata.obs[self.column_ctype]==ctype], 
-                                self.adata.var.index.tolist())
-                    k_sums_nA = sc.get.obs_df(self.adata[self.adata.obs[self.column_ctype]!=ctype], 
-                                self.adata.var.index.tolist())
-                
-                # Determine cutoff value for CDF calculation (99th percentile of the largest gene)
-                cutoff_k = np.max([k_sums_A.quantile(0.99).max(),
-                                k_sums_nA.quantile(0.99).max(), 1])
-                cutoff_k = int(cutoff_k)
-                
-                # Use sparse sampling with step size from config
-                sparse_points = np.arange(0, cutoff_k, self.config.sparse_step)
-                if len(sparse_points) == 0:  # Ensure at least one point
-                    sparse_points = np.array([0])
-                
-                # Initialize arrays for sparse CDFs
-                alpha_sparse = np.zeros(shape=(self.adata.shape[1], len(sparse_points)))
-                beta_sparse = np.zeros(shape=(self.adata.shape[1], len(sparse_points)))
-                
-                # Calculate sparse CDFs
-                for i, l in enumerate(sparse_points):
-                    alpha_sparse[:, i] = self.empirical_cdf_v0(k_sums_A, l).values
-                    beta_sparse[:, i] = self.empirical_cdf_v0(k_sums_nA, l).values
-                
-                # Identify promising genes based on scoring method
-                promising_genes = np.ones(self.adata.shape[1], dtype=bool)  # Default all genes to promising
-                
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    sparse_diff = beta_sparse - alpha_sparse
-                    max_sparse_diff = np.max(sparse_diff, axis=1)
-                    promising_genes = max_sparse_diff > self.config.promising_threshold
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # For sensFPRzero, we want genes where beta can reach high values
-                    max_beta = np.max(beta_sparse, axis=1)
-                    promising_genes = max_beta > (1 - self.config.promising_threshold)
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # For sensPPV99, we want genes where PPV can exceed 0.99
-                    # Calculate sparse PPV
-                    ppv_sparse = np.nan_to_num((1-alpha_sparse)/(2-alpha_sparse-beta_sparse))
-                    # Check if any value exceeds 0.99
-                    promising_genes = np.max(ppv_sparse > 0.99, axis=1) > 0
-                
-                # Initialize full arrays for alpha and beta
-                alpha = np.zeros(shape=(self.adata.shape[1], int(cutoff_k)))
-                beta = np.zeros(shape=(self.adata.shape[1], int(cutoff_k)))
-                
-                # Copy sparse results into the full arrays to avoid recalculation
-                for i, l in enumerate(sparse_points):
-                    alpha[:, l] = alpha_sparse[:, i]
-                    beta[:, l] = beta_sparse[:, i]
-                
-                # Calculate remaining points only for promising genes
-                remaining_points = np.setdiff1d(np.arange(cutoff_k), sparse_points)
-                
-                for l in remaining_points:
-                    # Calculate alpha, but only for promising genes
-                    if np.any(promising_genes):
-                        if promising_genes.all():  # If all genes are promising, calculate for all
-                            alpha[:, l] = self.empirical_cdf_v0(k_sums_A, l).values
-                            beta[:, l] = self.empirical_cdf_v0(k_sums_nA, l).values
-                        else:  # Otherwise calculate only for promising genes
-                            # Get indices of promising genes
-                            promising_indices = np.where(promising_genes)[0]
-                            
-                            # Calculate for promising genes only
-                            promising_gene_names = self.adata.var.index[promising_indices]
-                            k_sums_A_promising = k_sums_A[promising_gene_names]
-                            k_sums_nA_promising = k_sums_nA[promising_gene_names]
-                            
-                            alpha_promising = self.empirical_cdf_v0(k_sums_A_promising, l).values
-                            beta_promising = self.empirical_cdf_v0(k_sums_nA_promising, l).values
-                            
-                            # Assign values back to the right positions
-                            alpha[promising_indices, l] = alpha_promising
-                            beta[promising_indices, l] = beta_promising
-                
-                # Calculate scores based on the scoring method
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    scores_ctype[k] = (beta-alpha)[np.arange(self.adata.shape[1]), np.argmax(beta-alpha, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    scores_ctype[k] = (1-alpha)[np.arange(self.adata.shape[1]), np.argmax(beta, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    ppv = np.nan_to_num((1-alpha)/(2-alpha-beta))
-                    scores_ctype[k] = ((1-alpha)[np.arange(self.adata.shape[1]), 
-                                    np.argmax(ppv>0.99, axis=1)]) * (np.sum(ppv>0.99, axis=1)>0)
-            
-            cell_elapsed_time = time.time() - cell_start_time
-            logger.debug(f"Completed empirical scores for {ctype} in {cell_elapsed_time:.2f} seconds")
-            return ctype, pd.DataFrame(scores_ctype)
-        
-        # Get list of cell types to process
-        cell_types_to_process = [ctype for ctype in self.adata.obs[self.column_ctype].unique()]
-        
-        # Process cell types in parallel using joblib
-        n_jobs = self.config.n_jobs 
-        logger.info(f"Starting parallel processing with joblib")
-        
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(process_cell_type)(ctype) for ctype in cell_types_to_process
-        )
-        
-        # Convert results to dictionary
-        scores_all = {ctype: score for ctype, score in results}
-        
-        # Apply multi-category correction and filter
-        corr_scores = self._apply_multi_category_correction(scores_all)
-        scores = {}
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            if filtered_scores[ctype].empty:
-                scores[ctype] = pd.DataFrame([])
-            else:
-                scores[ctype] = corr_scores[ctype].loc[filtered_scores[ctype].index].clip(upper=1)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Completed parallel empirical score calculation in {elapsed_time:.2f} seconds")
-        
-        return scores
-    
-    def empirical_scores_v0_optimized_parallel(self, filtered_scores):
-        """
-        Calculate empirical marker gene scores through simulation with sparse sampling optimization,
-        using parallel processing for improved performance.
-        
-        Args:
-            filtered_scores: Dictionary of filtered scores by cell type
-                
-        Returns:
-            Dictionary of empirical scores by cell type
-        """
-        from joblib import Parallel, delayed
-        import time
-        
-        start_time = time.time()
-        logger.info("Starting parallel empirical score calculation")
-        
-        # Initialize an empty list to collect genes of interest
-        gene_list = []
-        
-        # Set random seed for reproducibility
-        np.random.seed(self.config.random_seed)
-        
-        # Collect all genes from filtered_scores across all cell types
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            if not filtered_scores[ctype].empty:
-                gene_list += filtered_scores[ctype].index.tolist()
-        
-        # Remove duplicates while preserving order
-        gene_list = list(dict.fromkeys(gene_list))
-        logger.info(f"Computing empirical scores for {len(gene_list)} genes")
-        
-        # Create a subset of the AnnData object containing only genes of interest
-        self.adata = self.adata[:, gene_list]
-        
-        # Define a function to process a single cell type
-        def process_cell_type(ctype):
-            logger.debug(f"Processing empirical scores for cell type: {ctype}")
-            cell_start_time = time.time()
-            
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = np.zeros(shape=(self.adata.shape[1], len(self.config.k_values)))
-            scores_ctype = pd.DataFrame(scores_ctype, index=self.adata.var.index, columns=self.config.k_values)
-            
-            # Extract expression data for target and non-target cells
-            expr_A = sc.get.obs_df(self.adata[self.adata.obs[self.column_ctype]==ctype], 
-                                self.adata.var.index.tolist())
-            expr_nA = sc.get.obs_df(self.adata[self.adata.obs[self.column_ctype]!=ctype], 
-                                self.adata.var.index.tolist())
-            
-            # Calculate scores for each k value
-            for k in self.config.k_values:
-                if k > 1:
-                    # Sample k cells from target population n_sim times
-                    sampled_A = np.random.choice(expr_A.shape[0], (self.config.n_simulations, k), replace=True)
-                    k_sums_A = pd.DataFrame(expr_A.values[sampled_A].sum(axis=1), columns=expr_A.columns)
-                    
-                    # Sample k cells from non-target population n_sim times
-                    sampled_nA = np.random.choice(expr_nA.shape[0], (self.config.n_simulations, k), replace=True)
-                    k_sums_nA = pd.DataFrame(expr_nA.values[sampled_nA].sum(axis=1), columns=expr_nA.columns)
-                else:
-                    # For k=1, no aggregation needed, use raw expression values
-                    k_sums_A = expr_A
-                    k_sums_nA = expr_nA
-                
-                # Determine cutoff value for CDF calculation (99th percentile of the largest gene)
-                cutoff_k = np.max([k_sums_A.quantile(0.99).max(),
-                                k_sums_nA.quantile(0.99).max(), 1])
-                cutoff_k = int(cutoff_k)
-                
-                # Use sparse sampling with step size from config
-                sparse_points = np.arange(0, cutoff_k, self.config.sparse_step)
-                if len(sparse_points) == 0:  # Ensure at least one point
-                    sparse_points = np.array([0])
-                
-                # Initialize arrays for sparse CDFs
-                alpha_sparse = np.zeros(shape=(self.adata.shape[1], len(sparse_points)))
-                beta_sparse = np.zeros(shape=(self.adata.shape[1], len(sparse_points)))
-                
-                # Calculate sparse CDFs
-                for i, l in enumerate(sparse_points):
-                    alpha_sparse[:, i] = self.empirical_cdf_v0(k_sums_A, l).values
-                    beta_sparse[:, i] = self.empirical_cdf_v0(k_sums_nA, l).values
-                
-                # Identify promising genes based on scoring method
-                promising_genes = np.ones(self.adata.shape[1], dtype=bool)  # Default all genes to promising
-                
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    sparse_diff = beta_sparse - alpha_sparse
-                    max_sparse_diff = np.max(sparse_diff, axis=1)
-                    promising_genes = max_sparse_diff > self.config.promising_threshold
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # For sensFPRzero, we want genes where beta can reach high values
-                    max_beta = np.max(beta_sparse, axis=1)
-                    promising_genes = max_beta > (1 - self.config.promising_threshold)
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # For sensPPV99, we want genes where PPV can exceed 0.99
-                    # Calculate sparse PPV
-                    ppv_sparse = np.nan_to_num((1-alpha_sparse)/(2-alpha_sparse-beta_sparse))
-                    # Check if any value exceeds 0.99
-                    promising_genes = np.max(ppv_sparse > 0.99, axis=1) > 0
-                
-                # Initialize full arrays for alpha and beta
-                alpha = np.zeros(shape=(self.adata.shape[1], int(cutoff_k)))
-                beta = np.zeros(shape=(self.adata.shape[1], int(cutoff_k)))
-                
-                # Copy sparse results into the full arrays to avoid recalculation
-                for i, l in enumerate(sparse_points):
-                    alpha[:, l] = alpha_sparse[:, i]
-                    beta[:, l] = beta_sparse[:, i]
-                
-                # Calculate remaining points only for promising genes
-                remaining_points = np.setdiff1d(np.arange(cutoff_k), sparse_points)
-                
-                for l in remaining_points:
-                    # Calculate alpha, but only for promising genes
-                    if np.any(promising_genes):
-                        if promising_genes.all():  # If all genes are promising, calculate for all
-                            alpha[:, l] = self.empirical_cdf_v0(k_sums_A, l).values
-                            beta[:, l] = self.empirical_cdf_v0(k_sums_nA, l).values
-                        else:  # Otherwise calculate only for promising genes
-                            # Get indices of promising genes
-                            promising_indices = np.where(promising_genes)[0]
-                            
-                            # Calculate for promising genes only
-                            promising_gene_names = self.adata.var.index[promising_indices]
-                            k_sums_A_promising = k_sums_A[promising_gene_names]
-                            k_sums_nA_promising = k_sums_nA[promising_gene_names]
-                            
-                            alpha_promising = self.empirical_cdf_v0(k_sums_A_promising, l).values
-                            beta_promising = self.empirical_cdf_v0(k_sums_nA_promising, l).values
-                            
-                            # Assign values back to the right positions
-                            alpha[promising_indices, l] = alpha_promising
-                            beta[promising_indices, l] = beta_promising
-                
-                # Calculate scores based on the scoring method
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    scores_ctype[k] = (beta-alpha)[np.arange(self.adata.shape[1]), np.argmax(beta-alpha, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    scores_ctype[k] = (1-alpha)[np.arange(self.adata.shape[1]), np.argmax(beta, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    ppv = np.nan_to_num((1-alpha)/(2-alpha-beta))
-                    scores_ctype[k] = ((1-alpha)[np.arange(self.adata.shape[1]), 
-                                    np.argmax(ppv>0.99, axis=1)]) * (np.sum(ppv>0.99, axis=1)>0)
-            
-            cell_elapsed_time = time.time() - cell_start_time
-            logger.debug(f"Completed empirical scores for {ctype} in {cell_elapsed_time:.2f} seconds")
-            return ctype, pd.DataFrame(scores_ctype)
-        
-        # Get list of cell types to process
-        cell_types_to_process = [ctype for ctype in self.adata.obs[self.column_ctype].unique()]
-        
-        # Process cell types in parallel using joblib
-        n_jobs = self.config.n_jobs 
-        logger.info(f"Starting parallel processing with joblib")
-        
-        results = Parallel(n_jobs=n_jobs, verbose=10)(
-            delayed(process_cell_type)(ctype) for ctype in cell_types_to_process
-        )
-        
-        # Convert results to dictionary
-        scores_all = {ctype: score for ctype, score in results}
-        
-        # Apply multi-category correction and filter
-        corr_scores = self._apply_multi_category_correction(scores_all)
-        scores = {}
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            if filtered_scores[ctype].empty:
-                scores[ctype] = pd.DataFrame([])
-            else:
-                scores[ctype] = corr_scores[ctype].loc[filtered_scores[ctype].index].clip(upper=1)
-        
-        elapsed_time = time.time() - start_time
-        logger.info(f"Completed parallel empirical score calculation in {elapsed_time:.2f} seconds")
-        
-        return scores
-
-    def empirical_scores_v0_optimized(self, filtered_scores):
-        """
-        Calculate empirical marker gene scores through simulation with sparse sampling optimization.
-        Uses config parameters for sparse_step and promising_threshold.
-        
-        Args:
-            filtered_scores: Dictionary of filtered scores by cell type
-                
-        Returns:
-            Dictionary of empirical scores by cell type
-        """
-        # Initialize an empty list to collect genes of interest
-        gene_list = []
-        
-        # Set random seed for reproducibility
-        np.random.seed(self.config.random_seed)
-        
-        # Dictionary to store scores for all cell types
-        scores_all = {}
-        
-        # Collect all genes from filtered_scores across all cell types
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            if not filtered_scores[ctype].empty:
-                gene_list += filtered_scores[ctype].index.tolist()
-        logger.info(f"Computing empirical scores for {len(gene_list)} genes")
-        
-        # Create a subset of the AnnData object containing only genes of interest
-        adata_subset = self.adata[:, gene_list].copy()
-        
-        # Iterate through each cell type
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = np.zeros(shape=(adata_subset.shape[1], len(self.config.k_values)))
-            scores_ctype = pd.DataFrame(scores_ctype, index=adata_subset.var.index, columns=self.config.k_values)
-            
-            # Extract expression data for target and non-target cells
-            expr_A = sc.get.obs_df(adata_subset[adata_subset.obs[self.column_ctype]==ctype], 
-                                adata_subset.var.index.tolist())
-            expr_nA = sc.get.obs_df(adata_subset[adata_subset.obs[self.column_ctype]!=ctype], 
-                                adata_subset.var.index.tolist())
-            
-            # Calculate scores for each k value
-            for k in self.config.k_values:
-                if k > 1:
-                    # Sample k cells from target population n_sim times
-                    sampled_A = np.random.choice(expr_A.shape[0], (self.config.n_simulations, k), replace=True)
-                    k_sums_A = pd.DataFrame(expr_A.values[sampled_A].sum(axis=1), columns=expr_A.columns)
-                    
-                    # Sample k cells from non-target population n_sim times
-                    sampled_nA = np.random.choice(expr_nA.shape[0], (self.config.n_simulations, k), replace=True)
-                    k_sums_nA = pd.DataFrame(expr_nA.values[sampled_nA].sum(axis=1), columns=expr_nA.columns)
-                else:
-                    # For k=1, no aggregation needed, use raw expression values
-                    k_sums_A = expr_A
-                    k_sums_nA = expr_nA
-                
-                # Determine cutoff value for CDF calculation (99th percentile of the largest gene)
-                cutoff_k = np.max([k_sums_A.quantile(0.99).max(),
-                                k_sums_nA.quantile(0.99).max(), 1])
-                cutoff_k = int(cutoff_k)
-                
-                # Use sparse sampling with step size from config
-                sparse_points = np.arange(0, cutoff_k, self.config.sparse_step)
-                if len(sparse_points) == 0:  # Ensure at least one point
-                    sparse_points = np.array([0])
-                
-                # Initialize arrays for sparse CDFs
-                alpha_sparse = np.zeros(shape=(adata_subset.shape[1], len(sparse_points)))
-                beta_sparse = np.zeros(shape=(adata_subset.shape[1], len(sparse_points)))
-                
-                # Calculate sparse CDFs
-                for i, l in enumerate(sparse_points):
-                    alpha_sparse[:, i] = self.empirical_cdf_v0(k_sums_A, l).values
-                    beta_sparse[:, i] = self.empirical_cdf_v0(k_sums_nA, l).values
-                
-                # Identify promising genes based on scoring method
-                promising_genes = np.ones(adata_subset.shape[1], dtype=bool)  # Default all genes to promising
-                
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    sparse_diff = beta_sparse - alpha_sparse
-                    max_sparse_diff = np.max(sparse_diff, axis=1)
-                    promising_genes = max_sparse_diff > self.config.promising_threshold
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    # For sensFPRzero, we want genes where beta can reach high values
-                    max_beta = np.max(beta_sparse, axis=1)
-                    promising_genes = max_beta > (1 - self.config.promising_threshold)
-                    
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    # For sensPPV99, we want genes where PPV can exceed 0.99
-                    # Calculate sparse PPV
-                    ppv_sparse = np.nan_to_num((1-alpha_sparse)/(2-alpha_sparse-beta_sparse))
-                    # Check if any value exceeds 0.99
-                    promising_genes = np.max(ppv_sparse > 0.99, axis=1) > 0
-                
-                # Initialize full arrays for alpha and beta
-                alpha = np.zeros(shape=(adata_subset.shape[1], int(cutoff_k)))
-                beta = np.zeros(shape=(adata_subset.shape[1], int(cutoff_k)))
-                
-                # Copy sparse results into the full arrays to avoid recalculation
-                for i, l in enumerate(sparse_points):
-                    alpha[:, l] = alpha_sparse[:, i]
-                    beta[:, l] = beta_sparse[:, i]
-                
-                # Calculate remaining points only for promising genes
-                remaining_points = np.setdiff1d(np.arange(cutoff_k), sparse_points)
-                
-                for l in remaining_points:
-                    # Calculate alpha, but only for promising genes
-                    if np.any(promising_genes):
-                        if promising_genes.all():  # If all genes are promising, calculate for all
-                            alpha[:, l] = self.empirical_cdf_v0(k_sums_A, l).values
-                            beta[:, l] = self.empirical_cdf_v0(k_sums_nA, l).values
-                        else:  # Otherwise calculate only for promising genes
-                            # Get indices of promising genes
-                            promising_indices = np.where(promising_genes)[0]
-                            
-                            # Calculate for promising genes only
-                            promising_gene_names = adata_subset.var.index[promising_indices]
-                            k_sums_A_promising = k_sums_A[promising_gene_names]
-                            k_sums_nA_promising = k_sums_nA[promising_gene_names]
-                            
-                            alpha_promising = self.empirical_cdf_v0(k_sums_A_promising, l).values
-                            beta_promising = self.empirical_cdf_v0(k_sums_nA_promising, l).values
-                            
-                            # Assign values back to the right positions
-                            alpha[promising_indices, l] = alpha_promising
-                            beta[promising_indices, l] = beta_promising
-                
-                # Calculate scores based on the scoring method
-                if self.config.scoring_method == ScoringMethod.DIFF:
-                    scores_ctype[k] = (beta-alpha)[np.arange(adata_subset.shape[1]), np.argmax(beta-alpha, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_FPR_ZERO:
-                    scores_ctype[k] = (1-alpha)[np.arange(adata_subset.shape[1]), np.argmax(beta, axis=1)]
-                elif self.config.scoring_method == ScoringMethod.SENS_PPV_99:
-                    ppv = np.nan_to_num((1-alpha)/(2-alpha-beta))
-                    scores_ctype[k] = ((1-alpha)[np.arange(adata_subset.shape[1]), 
-                                    np.argmax(ppv>0.99, axis=1)]) * (np.sum(ppv>0.99, axis=1)>0)
-            
-            scores_all[ctype] = pd.DataFrame(scores_ctype)
-        
-        # Apply multi-category correction and filter
-        corr_scores = self._apply_multi_category_correction(scores_all)
-        scores = {}
-        for ctype in self.adata.obs[self.column_ctype].unique():
-            if filtered_scores[ctype].empty:
-                scores[ctype] = pd.DataFrame([])
-            else:
-                scores[ctype] = corr_scores[ctype].loc[filtered_scores[ctype].index].clip(upper=1)
-        
-        return scores
-
-    def empirical_scores_v0(self, filtered_scores, adata, column_ctype, column_patient, k_values, scoring, seed=0, n_sim=1000):
-        """
-        Calculate empirical marker gene scores through simulation.
-        
-        This function computes empirical scores for candidate marker genes by randomly sampling cells
-        and evaluating their expression patterns across different cell types.
-        
-        Args:
-            filtered_scores: Dictionary of filtered scores by cell type
-            adata: AnnData object containing gene expression data
-            column_ctype: Column name in adata.obs for cell type annotations
-            column_patient: Column name in adata.obs for patient IDs
-            k_values: List of k values (sampling sizes) to test
-            scoring: Scoring method ('diff', 'sensFPRzero', or 'sensPPV99')
-            seed: Random seed for reproducibility (default: 0)
-            n_sim: Number of simulations to run (default: 1000)
-            
-        Returns:
-            Dictionary of empirical scores by cell type
-        """
-        # Initialize an empty list to collect genes of interest
-        gene_list = []
-        
-        # Set random seed for reproducibility
-        np.random.seed(seed)
-        
-        # Dictionary to store scores for all cell types
-        scores_all = {}
-        
-        # Collect all genes from filtered_scores across all cell types
-        for ctype in adata.obs[column_ctype].unique():
-            if not filtered_scores[ctype].empty:
-                gene_list += filtered_scores[ctype].index.tolist()
-        
-        # Create a subset of the AnnData object containing only genes of interest
-        adata_subset = adata[:, gene_list].copy()
-        
-        # Iterate through each cell type
-        for ctype in adata.obs[column_ctype].unique():
-            # Initialize score matrix (rows=genes, columns=k_values)
-            scores_ctype = np.zeros(shape=(adata_subset.shape[1], len(k_values)))
-            scores_ctype = pd.DataFrame(scores_ctype, index=adata_subset.var.index, columns=k_values)
-            
-            # Extract expression data for target cells (cells of current cell type)
-            expr_A = sc.get.obs_df(adata_subset[adata_subset.obs[column_ctype]==ctype], 
-                                adata_subset.var.index.tolist())
-            
-            # Extract expression data for non-target cells (cells of other cell types)
-            expr_nA = sc.get.obs_df(adata_subset[adata_subset.obs[column_ctype]!=ctype], 
-                                adata_subset.var.index.tolist())
-            
-            # Calculate scores for each k value
-            for k in k_values:
-                # For k > 1, perform random sampling to simulate k-cell aggregation
-                if k > 1:
-                    # Sample k cells from target population n_sim times
-                    sampled_A = np.random.choice(expr_A.shape[0], (n_sim, k), replace=True)
-                    # Sum expression values across k cells for each simulation
-                    k_sums_A = pd.DataFrame(expr_A.values[sampled_A].sum(axis=1), columns=expr_A.columns)
-                    
-                    # Sample k cells from non-target population n_sim times
-                    sampled_nA = np.random.choice(expr_nA.shape[0], (n_sim, k), replace=True)
-                    # Sum expression values across k cells for each simulation
-                    k_sums_nA = pd.DataFrame(expr_nA.values[sampled_nA].sum(axis=1), columns=expr_nA.columns)
-                else:
-                    # For k=1, no aggregation needed, use raw expression values
-                    k_sums_A = expr_A
-                    k_sums_nA = expr_nA
-                
-                # Determine cutoff value for CDF calculation (99th percentile of the largest gene)
-                cutoff_k = np.max([k_sums_A.quantile(0.99).max(),
-                                k_sums_nA.quantile(0.99).max(), 1])
-                
-                # Calculate empirical CDF (alpha) for target cells at each count level
-                alpha = np.zeros(shape=(adata_subset.shape[1], int(cutoff_k)))
-                for l in np.arange(int(cutoff_k)):
-                    alpha[:,l] = self.empirical_cdf_v0(k_sums_A, l).values
-                
-                # Calculate empirical CDF (beta) for non-target cells at each count level
-                beta = np.zeros(shape=(adata_subset.shape[1], int(cutoff_k)))
-                for l in np.arange(int(cutoff_k)):
-                    beta[:,l] = self.empirical_cdf_v0(k_sums_nA, l).values
-                
-                # Calculate scores based on the specified scoring method
-                if scoring == 'diff':
-                    # Maximum difference between specificity (beta) and false negative rate (alpha)
-                    scores_ctype[k] = (beta-alpha)[np.arange(adata_subset.shape[1]), 
-                                                np.argmax(beta-alpha, axis=1)]
-                elif scoring == 'sensFPRzero':
-                    # Sensitivity (1-alpha) at point of zero false positive rate (max beta)
-                    scores_ctype[k] = (1-alpha)[np.arange(adata_subset.shape[1]), 
-                                            np.argmax(beta, axis=1)]
-                elif scoring == 'sensPPV99':
-                    # Positive predictive value calculation
-                    ppv = np.nan_to_num((1-alpha)/(2-alpha-beta))
-                    # Sensitivity at point where PPV > 99%
-                    scores_ctype[k] = ((1-alpha)[np.arange(adata_subset.shape[1]), 
-                                                np.argmax(ppv>0.99, axis=1)]) * (np.sum(ppv>0.99, axis=1)>0)
-            
-            # Store scores for this cell type
-            scores_all[ctype] = pd.DataFrame(scores_ctype)
-        
-        # Apply multi-category correction to normalize scores
-        corr_scores = self.multi_cat_correction(scores_all)
-        
-        # Filter scores to include only genes from filtered_scores
-        scores = {}
-        for ctype in adata.obs[column_ctype].unique():
-            if filtered_scores[ctype].empty:
-                scores[ctype] = pd.DataFrame([])
-            else:
-                # Extract scores for filtered genes and clip values to max of 1
-                scores[ctype] = corr_scores[ctype].loc[filtered_scores[ctype].index].clip(upper=1)
-        
-        return scores
-    
     def multi_cat_correction(self, computed_scores):
         """
         Adjusts marker scores across different cell types by normalizing them to sum to 1.
@@ -1387,6 +845,71 @@ class ScSherlock:
         }
         return processed_scores
 
+    def multi_cat_correction_for_optimized(self, computed_scores):
+        """
+        Adjusts marker scores across different cell types by normalizing them to sum to 1.
+        
+        Args:
+            computed_scores (dict): A dictionary containing marker scores in the form of a
+                                Pandas DataFrame for each cell type.
+        
+        Returns:
+            dict: A dictionary where keys are the cell types from `computed_scores`,
+                and values are Pandas DataFrames with normalized scores.
+        """
+        import pandas as pd
+        
+        # First, create a combined DataFrame with all non-empty scores
+        all_scores = {}
+        
+        # Filter out empty DataFrames
+        valid_scores = {k: v for k, v in computed_scores.items() if not v.empty}
+        
+        # If all DataFrames are empty, return the original dictionary
+        if not valid_scores:
+            return computed_scores
+        
+        # For each gene (row), sum the scores across all cell types
+        gene_sums = {}
+        
+        # Process each cell type
+        for cell_type, df in valid_scores.items():
+            # Iterate through each row of the DataFrame
+            for idx, row in df.iterrows():
+                gene = idx  # Assuming gene names are the index
+                if gene not in gene_sums:
+                    gene_sums[gene] = {}
+                
+                # Extract scores for each column and add to gene_sums
+                for col in df.columns:
+                    if col not in gene_sums[gene]:
+                        gene_sums[gene][col] = 0
+                    gene_sums[gene][col] += row[col]
+        
+        # Now normalize each score by dividing by the total for that gene and column
+        processed_scores = {}
+        
+        for cell_type, df in valid_scores.items():
+            # Create a copy of the original DataFrame
+            normalized_df = df.copy()
+            
+            # Normalize each value
+            for idx, row in df.iterrows():
+                gene = idx
+                for col in df.columns:
+                    if gene in gene_sums and col in gene_sums[gene] and gene_sums[gene][col] != 0:
+                        normalized_df.at[idx, col] = row[col] / gene_sums[gene][col]
+                    else:
+                        normalized_df.at[idx, col] = 0
+            
+            processed_scores[cell_type] = normalized_df
+        
+        # Add empty DataFrames back to the result
+        for cell_type, df in computed_scores.items():
+            if df.empty and cell_type not in processed_scores:
+                processed_scores[cell_type] = df
+        
+        return processed_scores
 
     def _construct_top_marker_list(self, sorted_emp_table: Dict) -> Dict[str, str]:
         """
@@ -1541,7 +1064,7 @@ class ScSherlock:
                 
         return markers_df
     
-    def plot_marker_heatmap(self, n_genes=1, cutoff=0, groupby=None, cmap='viridis', standard_scale='var', 
+    def plot_marker_heatmap(self, n_genes=1, cutoff=0, groupby=None,remove_ctype_no_marker=False, cmap='viridis', standard_scale='var', 
                         use_raw=False, save=None, show=None, **kwargs):
         """
         Create a heatmap visualization of the identified marker genes
@@ -1602,16 +1125,15 @@ class ScSherlock:
         
         # Filter adata to only include cell types that have markers
         mask = self.adata.obs[groupby].isin(cell_to_genes.keys())
-        adata_filtered = self.adata[mask]
-        
-        if adata_filtered.n_obs == 0:
-            raise ValueError(f"No cells found for the given cell types in {groupby}")
-        
+       
+    
         # Get unique cell types in the filtered data to preserve the order
-        cell_types = adata_filtered.obs[groupby].cat.categories.tolist()
-        
+        if remove_ctype_no_marker:
+            cell_types = self.adata[mask].obs[groupby].cat.categories.tolist()
+        else:
+            cell_types = self.adata.obs[groupby].cat.categories.tolist()
         # Filter cell types to only those that appear in the data
-        cell_types = [ct for ct in cell_types if ct in adata_filtered.obs[groupby].unique()]
+        cell_types = [ct for ct in cell_types if ct in self.adata.obs[groupby].unique()]
         
         # Create an ordered list of genes based on the cell type order
         ordered_genes = []
@@ -1625,17 +1147,17 @@ class ScSherlock:
         
         # Create the plot with the ordered genes
         return sc.pl.matrixplot(
-            adata_filtered, 
-            var_names=ordered_genes, 
-            groupby=groupby, 
-            cmap=cmap, 
-            use_raw=use_raw, 
+            self.adata if not remove_ctype_no_marker else self.adata[mask],
+            var_names=ordered_genes,
+            groupby=groupby,
+            cmap=cmap,
+            use_raw=use_raw,
             standard_scale=standard_scale,
             categories_order=cell_types,  # Ensure cell types are in the desired order
             save=save,
             show=show,
             **kwargs
-        )
+            )
     
     def plot_marker_violins(self, markers=None, n_markers=5, figsize=(12, 10), 
                         sort_by_expression=True, jitter=0.4, alpha=0.2):
@@ -1692,7 +1214,7 @@ class ScSherlock:
                     marker_cell_type = None
                     
                 sc.pl.violin(self.adata, marker, groupby=self.column_ctype, 
-                            ax=ax, show=False, jitter=jitter, alpha=alpha, raw=False)
+                            ax=ax, show=False, jitter=jitter, alpha=alpha, use_raw=False)
                 
                 if marker_cell_type:
                     ax.set_title(f"{marker} (marker for {marker_cell_type})")
@@ -1708,67 +1230,6 @@ class ScSherlock:
         return fig
     
 
-    def plot_marker_roc(self, markers=None, n_markers=5, figsize=(12, 10), k=None):
-        """
-        Plot ROC curves for marker genes showing their sensitivity/specificity tradeoffs
-        
-        Args:
-            markers: Dictionary mapping cell types to marker genes
-            n_markers: Number of markers to show per cell type if markers=None
-            figsize: Figure size
-            k: Which k value to use for ROC calculation (if None, uses the first k value)
-            
-        Returns:
-            Figure with ROC curves for each marker
-        """
-        from sklearn.metrics import roc_curve, auc
-        
-        # Get markers to plot
-        if markers is None:
-            if self.top_markers is None:
-                raise ValueError("No markers available. Run ScSherlock.run() first")
-            markers = self.top_markers
-        
-        # If k is not specified, use the first k value
-        if k is None:
-            k = self.config.k_values[0]
-        
-        # Create figure
-        fig, ax = plt.subplots(figsize=figsize)
-        
-        # Plot ROC curve for each marker
-        for ctype, genes in markers.items():
-            gene_list = [genes] if isinstance(genes, str) else genes
-            gene_list = gene_list[:n_markers]  # Limit to n_markers
-            
-            for gene in gene_list:
-                # Get expression values
-                if gene not in self.adata.var_names:
-                    continue
-                    
-                gene_expr = self.adata[:, gene].X.toarray().flatten()
-                y_true = (self.adata.obs[self.column_ctype] == ctype).astype(int).values
-                
-                # Calculate ROC curve
-                fpr, tpr, _ = roc_curve(y_true, gene_expr)
-                roc_auc = auc(fpr, tpr)
-                
-                # Plot ROC curve
-                ax.plot(fpr, tpr, lw=2, label=f'{gene} ({ctype}, AUC = {roc_auc:.2f})')
-        
-        # Add diagonal line
-        ax.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-        
-        # Set axes labels and title
-        ax.set_xlim([0.0, 1.0])
-        ax.set_ylim([0.0, 1.05])
-        ax.set_xlabel('False Positive Rate')
-        ax.set_ylabel('True Positive Rate')
-        ax.set_title('ROC Curve for Marker Genes')
-        ax.legend(loc="lower right")
-        
-        return fig
-    
     def plot_marker_scores_comparison(self, n_markers=10, figsize=(10, 6)):
         """
         Create a comparison plot of marker scores across different scoring methods
@@ -1876,26 +1337,25 @@ class ScSherlock:
         
         return fig
     
-
-    def plot_theoretical_vs_empirical(self, n_genes=20, figsize=(12, 10), cell_types=None):
+    def plot_corr_theoric_empiric(self, figsize=(10, 8), cell_types=None, min_genes=1, sort_by='correlation'):
         """
-        Create plots comparing theoretical vs empirical scores for marker genes
-        
-        This method produces multiple visualizations to compare theoretical and empirical scores:
-        1. Scatter plot of theoretical vs empirical scores
-        2. Bar plot of top genes showing both scores
-        3. Distribution plots showing the correlation
+        Plot correlation between theoretical and empirical scores for each cell type
         
         Args:
-            n_genes: Number of top genes to include in the visualizations
-            figsize: Figure size as (width, height)
-            cell_types: List of cell types to include (if None, includes all)
-            
-        Returns:
-            matplotlib.figure.Figure: The figure containing the visualizations
+            figsize (tuple): Figure size as (width, height), default is (10, 8)
+            cell_types (list): List of cell types to include. If None, includes all cell types
+            min_genes (int): Minimum number of genes required to calculate correlation for a cell type
+            sort_by (str): How to sort the cell types. Options are:
+                        - 'correlation': Sort by correlation value (default)
+                        - 'gene_count': Sort by number of genes
+                        - 'name': Sort alphabetically by cell type name
+                        - 'abs_correlation': Sort by absolute correlation value
         
+        Returns:
+            matplotlib.figure.Figure: The figure containing the correlation bar chart
+            
         Raises:
-            ValueError: If empirical scores are not available (must run with method='empiric')
+            ValueError: If empirical or theoretical scores are not available
         """
         if self.empirical_scores is None or self.theoretical_scores is None:
             raise ValueError("Both theoretical and empirical scores must be available. Run with method='empiric'")
@@ -1932,64 +1392,11 @@ class ScSherlock:
                         'gene': gene,
                         'cell_type': ctype,
                         'theoretical_score': theo_score,
-                        'empirical_score': emp_score,
-                        'abs_difference': abs(theo_score - emp_score)
+                        'empirical_score': emp_score
                     })
         
         # Convert to DataFrame
         comparison_df = pd.DataFrame(comparison_data)
-        
-        # Sort by difference
-        comparison_df = comparison_df.sort_values('abs_difference', ascending=False)
-        
-        # Create figure with subplots
-        fig = plt.figure(figsize=figsize)
-        
-        # Define subplot grid: 2 rows, 2 columns
-        gs = fig.add_gridspec(2, 2)
-        
-        # 1. Overall scatter plot (top left)
-        ax1 = fig.add_subplot(gs[0, 0])
-        sc = ax1.scatter(comparison_df['theoretical_score'], comparison_df['empirical_score'], 
-                alpha=0.7, c=comparison_df['abs_difference'], cmap='viridis')
-        
-        # Add diagonal line (perfect agreement)
-        max_val = max(comparison_df['theoretical_score'].max(), comparison_df['empirical_score'].max())
-        ax1.plot([0, max_val], [0, max_val], 'r--', alpha=0.7)
-        
-        ax1.set_xlabel('Theoretical Score')
-        ax1.set_ylabel('Empirical Score')
-        ax1.set_title('Theoretical vs Empirical Scores')
-        
-        # Add colorbar
-        cbar = plt.colorbar(sc, ax=ax1)
-        cbar.set_label('Absolute Difference')
-        
-        # 2. Bar plot for top genes with largest differences (top right)
-        ax2 = fig.add_subplot(gs[0, 1])
-        
-        # Get top n genes with largest differences
-        top_diff_genes = comparison_df.head(n_genes)
-        
-        # Create index for bars
-        x = np.arange(len(top_diff_genes))
-        width = 0.35
-        
-        # Create bars
-        ax2.bar(x - width/2, top_diff_genes['theoretical_score'], width, label='Theoretical')
-        ax2.bar(x + width/2, top_diff_genes['empirical_score'], width, label='Empirical')
-        
-        # Add gene names
-        ax2.set_xticks(x)
-        ax2.set_xticklabels([f"{row['gene']}\n({row['cell_type']})" for _, row in top_diff_genes.iterrows()], 
-                        rotation=90, ha='right')
-        
-        ax2.set_ylabel('Score')
-        ax2.set_title(f'Top {n_genes} Genes with Largest Score Differences')
-        ax2.legend()
-        
-        # 3. Correlation heatmap by cell type (bottom left)
-        ax3 = fig.add_subplot(gs[1, 0])
         
         # Calculate correlation for each cell type
         correlations = []
@@ -1997,50 +1404,586 @@ class ScSherlock:
             # Get genes with both scores
             ctype_df = comparison_df[comparison_df['cell_type'] == ctype]
             
-            if len(ctype_df) >= 5:  # Need enough genes for meaningful correlation
+            if len(ctype_df) >= min_genes:  # Need enough genes for meaningful correlation
                 corr = np.corrcoef(ctype_df['theoretical_score'], ctype_df['empirical_score'])[0, 1]
-                correlations.append({'cell_type': ctype, 'correlation': corr, 'gene_count': len(ctype_df)})
+                correlations.append({
+                    'cell_type': ctype, 
+                    'correlation': corr, 
+                    'abs_correlation': abs(corr),
+                    'gene_count': len(ctype_df)
+                })
         
         # Create correlation DataFrame
-        corr_df = pd.DataFrame(correlations).sort_values('correlation', ascending=False)
+        corr_df = pd.DataFrame(correlations)
+        
+        # Sort based on selected method
+        if sort_by == 'correlation':
+            corr_df = corr_df.sort_values('correlation', ascending=False)
+        elif sort_by == 'gene_count':
+            corr_df = corr_df.sort_values('gene_count', ascending=False)
+        elif sort_by == 'name':
+            corr_df = corr_df.sort_values('cell_type')
+        elif sort_by == 'abs_correlation':
+            corr_df = corr_df.sort_values('abs_correlation', ascending=False)
+        else:
+            logger.warning(f"Unknown sort_by value: {sort_by}. Defaulting to 'correlation'")
+            corr_df = corr_df.sort_values('correlation', ascending=False)
+        
+        # Create figure
+        fig, ax = plt.subplots(figsize=figsize)
         
         # Plot correlation bars
-        ax3.barh(np.arange(len(corr_df)), corr_df['correlation'], color='skyblue')
-        ax3.set_yticks(np.arange(len(corr_df)))
-        ax3.set_yticklabels([f"{row['cell_type']} (n={row['gene_count']})" for _, row in corr_df.iterrows()])
+        bars = ax.barh(np.arange(len(corr_df)), corr_df['correlation'], color='skyblue')
         
-        ax3.set_xlabel('Correlation')
-        ax3.set_title('Correlation between Theoretical and Empirical Scores by Cell Type')
-        ax3.axvline(x=0, color='gray', linestyle='--')
-        ax3.set_xlim(-1, 1)
+        # Color-code the bars by correlation value
+        for i, bar in enumerate(bars):
+            corr = corr_df.iloc[i]['correlation']
+            if corr > 0.7:
+                bar.set_color('darkgreen')
+            elif corr > 0.5:
+                bar.set_color('forestgreen')
+            elif corr > 0.3:
+                bar.set_color('mediumseagreen')
+            elif corr > 0:
+                bar.set_color('lightgreen')
+            elif corr > -0.3:
+                bar.set_color('lightcoral')
+            elif corr > -0.5:
+                bar.set_color('indianred')
+            elif corr > -0.7:
+                bar.set_color('firebrick')
+            else:
+                bar.set_color('darkred')
         
-        # 4. Distribution plot of differences (bottom right)
-        ax4 = fig.add_subplot(gs[1, 1])
+        # Add cell type labels
+        ax.set_yticks(np.arange(len(corr_df)))
+        ax.set_yticklabels([f"{row['cell_type']} (n={row['gene_count']})" for _, row in corr_df.iterrows()])
         
-        # Calculate differences
-        differences = comparison_df['theoretical_score'] - comparison_df['empirical_score']
+        # Add value labels to the bars
+        for i, v in enumerate(corr_df['correlation']):
+            ax.text(v + np.sign(v)*0.02, i, f"{v:.2f}", va='center', fontweight='bold',
+                    color='black' if v >= 0 else 'white')
         
-        # Plot histogram of differences
-        ax4.hist(differences, bins=30, alpha=0.7, color='cornflowerblue')
-        ax4.axvline(x=0, color='red', linestyle='--')
+        # Add a vertical line at x=0
+        ax.axvline(x=0, color='gray', linestyle='--')
         
-        # Add statistics
-        mean_diff = differences.mean()
-        median_diff = differences.median()
-        ax4.text(0.05, 0.95, f"Mean: {mean_diff:.3f}\nMedian: {median_diff:.3f}", 
-                transform=ax4.transAxes, va='top', 
-                bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+        # Set axis limits, labels, and title
+        ax.set_xlim(-1, 1)
+        ax.set_xlabel('Pearson Correlation')
+        ax.set_title('Correlation between Theoretical and Empirical Scores by Cell Type')
         
-        ax4.set_xlabel('Theoretical - Empirical Score')
-        ax4.set_ylabel('Frequency')
-        ax4.set_title('Distribution of Score Differences')
-        
-        # Add overall statistics to figure title
-        overall_corr = np.corrcoef(comparison_df['theoretical_score'], comparison_df['empirical_score'])[0, 1]
-        fig.suptitle(f'Theoretical vs Empirical Score Comparison\nOverall Correlation: {overall_corr:.3f}', 
-                    fontsize=16)
+        # Add summary statistics as text
+        stats_text = (
+            f"Mean correlation: {corr_df['correlation'].mean():.3f}\n"
+            f"Median correlation: {corr_df['correlation'].median():.3f}\n"
+            f"Cell types with correlation > 0.5: {(corr_df['correlation'] > 0.5).sum()}/{len(corr_df)}"
+        )
+        ax.text(0.98, 0.02, stats_text, transform=ax.transAxes, ha='right', va='bottom',
+                bbox=dict(boxstyle='round', facecolor='white', alpha=0.9))
         
         plt.tight_layout()
-        fig.subplots_adjust(top=0.9)
         
         return fig
+    
+    def get_scores(self, cell_type: Optional[Union[str, List[str]]] = None, method: str = "empiric") -> Dict:
+        """
+        Get aggregated scores from the ScSherlock analysis
+        
+        Args:
+            cell_type (str or List[str], optional): If provided, return results only for this cell type
+                                                or list of cell types
+            method (str): Specify which method's scores to return: "theoric" or "empiric" (default: "empiric")
+            
+        Returns:
+            Dict: Dictionary with only the aggregated scores for each cell type, sorted by decreasing value
+            
+        Raises:
+            ValueError: If specified cell_type does not exist in the dataset or method is invalid,
+                        or if the specified method hasn't been run yet
+        """
+        # Validate method parameter
+        if method not in ["theoric", "empiric"]:
+            raise ValueError('Method must be either "theoric" or "empiric"')
+        
+        # Get the appropriate aggregated scores based on the method
+        if method == "theoric":
+            # Check if theoretical scores have been calculated
+            if self.aggregated_scores is None:
+                raise ValueError("Theoretical scores haven't been calculated yet. Run with method='theoric' first")
+            agg_scores = self.aggregated_scores
+        else:  # method == "empiric"
+            # Check if empirical scores have been calculated
+            if self.aggregated_empirical_scores is None:
+                raise ValueError("Empirical scores haven't been calculated yet. Run with method='empiric' first")
+            agg_scores = self.aggregated_empirical_scores
+        
+        # Create a dictionary to hold the results
+        results = {}
+        
+        # Process cell_type parameter if provided
+        if cell_type is not None:
+            cell_types_to_include = []
+            
+            # Convert single cell type to list for uniform processing
+            if isinstance(cell_type, str):
+                cell_types_to_include = [cell_type]
+            else:
+                cell_types_to_include = list(cell_type)
+            
+            # Validate that all specified cell types exist
+            for ct in cell_types_to_include:
+                if ct not in self.cell_types:
+                    raise ValueError(f"Cell type '{ct}' not found in the dataset")
+            
+            # Filter and sort scores by cell type
+            for ct in cell_types_to_include:
+                if ct in agg_scores and not isinstance(agg_scores[ct], pd.DataFrame) and not agg_scores[ct].empty:
+                    # Extract only the aggregated scores and sort in descending order
+                    results[ct] = agg_scores[ct].sort_values(ascending=False)
+        else:
+            # Sort aggregated scores for all cell types
+            for ct, scores in agg_scores.items():
+                if not isinstance(scores, pd.DataFrame) and not scores.empty:
+                    # Extract only the aggregated scores and sort in descending order
+                    results[ct] = scores.sort_values(ascending=False)
+        
+        return results
+
+    def create_proportion_based_hierarchy(self, annotation_columns, min_proportion=0.05):
+        """
+        Create hierarchy relationships based on co-occurrence proportions.
+        
+        Args:
+            annotation_columns (list): List of column names in adata.obs for hierarchy levels
+            min_proportion (float): Minimum proportion threshold for including relationships
+            
+        Returns:
+            dict: Hierarchical structure of cell types
+        """
+        relationships = {}
+        
+        # Process each pair of adjacent hierarchy levels
+        for i in range(len(annotation_columns) - 1):
+            parent_col = annotation_columns[i]
+            child_col = annotation_columns[i+1]
+            
+            # Get unique values for parent and child levels
+            parent_values = self.adata.obs[parent_col].unique()
+            child_values = self.adata.obs[child_col].unique()
+            
+            # Create relationships for this level pair
+            level_relationships = defaultdict(list)
+            
+            # For each parent value, find related child values
+            for parent_val in parent_values:
+                # Get cells with this parent value
+                parent_mask = self.adata.obs[parent_col] == parent_val
+                parent_cells = sum(parent_mask)
+                
+                if parent_cells == 0:
+                    continue
+                
+                # Check each child value
+                for child_val in child_values:
+                    # Count cells with both annotations
+                    both = sum(parent_mask & (self.adata.obs[child_col] == child_val))
+                    
+                    if both == 0:
+                        continue
+                    
+                    # Calculate proportion of parent cells with this child annotation
+                    proportion = both / parent_cells
+                    
+                    # If meets minimum proportion, add to relationships
+                    if proportion >= min_proportion:
+                        level_relationships[parent_val].append({
+                            'id': child_val,
+                            'proportion': float(proportion)
+                        })
+            
+            # Store relationships for this level pair
+            if i == 0:
+                relationships = {parent: sorted(children, key=lambda x: x['proportion'], reverse=True) 
+                            for parent, children in level_relationships.items()}
+            else:
+                # Integrate with existing hierarchy
+                for parent_level in list(relationships.keys()):
+                    for child_item in relationships[parent_level]:
+                        child_id = child_item['id']
+                        # If this child has its own children, add them
+                        if child_id in level_relationships:
+                            child_item['children'] = sorted(
+                                level_relationships[child_id], 
+                                key=lambda x: x['proportion'], 
+                                reverse=True
+                            )
+        
+        return relationships
+
+    def create_hierarchy_graph(self, annotation_columns, min_proportion=0.05, max_children=None):
+        """
+        Create a hierarchy graph based on co-occurrence proportions.
+        
+        Args:
+            annotation_columns (list): List of column names in adata.obs for hierarchy levels
+            min_proportion (float): Minimum proportion threshold for including relationships
+            max_children (int, optional): Maximum number of children to include for each node
+            
+        Returns:
+            networkx.DiGraph: Directed graph representing cell type hierarchy
+        """
+        # Create proportion-based relationships
+        relationships = self.create_proportion_based_hierarchy(annotation_columns, min_proportion)
+        
+        # Create directed graph
+        G = nx.DiGraph()
+        
+        # Add root node
+        G.add_node('root')
+        
+        # Add first level nodes connected to root
+        for parent in relationships:
+            G.add_edge('root', parent)
+            
+            # Helper function to recursively add child nodes
+            def add_children(parent_node, children):
+                # Limit number of children if specified
+                if max_children is not None and len(children) > max_children:
+                    # Take only the top N children by proportion
+                    children = sorted(children, key=lambda x: x['proportion'], reverse=True)[:max_children]
+                
+                for child_item in children:
+                    child_id = child_item['id']
+                    proportion = child_item['proportion']
+                    
+                    # Create node name and add edge
+                    child_node = f"{parent_node}_{child_id}"
+                    G.add_edge(parent_node, child_node)
+                    
+                    # Store attributes
+                    G.nodes[child_node]['label'] = child_id
+                    G.nodes[child_node]['proportion'] = proportion
+                    G.edges[parent_node, child_node]['weight'] = proportion
+                    
+                    # Recursively add grandchildren if any
+                    if 'children' in child_item:
+                        add_children(child_node, child_item['children'])
+            
+            # Add children for this parent
+            add_children(parent, relationships[parent])
+        
+        self.G = G
+
+    def visualize_hierarchy(self, min_proportion=0.05, max_children=None, output_file=None, figsize=(20, 12)):
+        """
+        Visualize the cell hierarchy using a hierarchical graph layout.
+        
+        Args:
+            annotation_columns (list): List of column names in adata.obs for hierarchy levels
+            min_proportion (float): Minimum proportion threshold for including relationships
+            max_children (int, optional): Maximum number of children to include for each node
+            output_file (str, optional): Path to save the figure
+            figsize (tuple): Figure size (width, height)
+            
+        Returns:
+            matplotlib.figure.Figure: Figure object with the hierarchy visualization
+        """
+        if hasattr(self, 'G') and self.G is not None:
+            G = self.G
+        else:
+            raise ValueError("No hierarchical graph present in ScSherlock object. Ensure hierarchy creation is successful.")
+
+            
+
+        plt.figure(figsize=figsize)
+        
+        try:
+            # Use dot layout for hierarchical trees
+            pos = graphviz_layout(G, prog='twopi')
+            
+            # Get node depths for coloring
+            node_depth = {}
+            for node in G.nodes():
+                node_depth[node] = 0 if node == 'root' else node.count('_') + 1
+            
+            max_depth = max(node_depth.values())
+            
+            # Prepare node colors
+            node_colors = [plt.cm.viridis(depth/max_depth) for node, depth in node_depth.items()]
+            
+            # Prepare edge widths
+            edge_widths = [G.edges[edge].get('weight', 0.5) * 3 + 0.5 for edge in G.edges()]
+            
+            # Prepare node labels
+            labels = {}
+            for node in G.nodes():
+                if node == 'root':
+                    labels[node] = 'ROOT'
+                elif 'label' in G.nodes[node]:
+                    label = G.nodes[node]['label']
+                    if 'proportion' in G.nodes[node] and node != 'root':
+                        prop = G.nodes[node]['proportion']
+                        labels[node] = f"{label}\n({prop:.1%})"
+                    else:
+                        labels[node] = label
+                else:
+                    parts = node.split('_')
+                    labels[node] = parts[-1]
+            
+            # Draw the graph
+            nx.draw(G, pos, 
+                    node_color=node_colors,
+                    node_size=800,
+                    width=edge_widths,
+                    with_labels=True,
+                    labels=labels,
+                    font_size=9,
+                    font_weight='bold',
+                    arrows=True,
+                    edge_color='gray',
+                    alpha=0.9)
+            
+            plt.title('Cell Type Hierarchy', fontsize=15)
+            plt.axis('off')
+            
+            # Save if output file is specified
+            if output_file:
+                plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            
+            fig = plt.gcf()
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Error with graphviz_layout: {e}")
+            logger.error("Make sure Graphviz is installed:")
+            logger.error("  Ubuntu/Debian: sudo apt-get install graphviz graphviz-dev")
+            logger.error("  macOS: brew install graphviz")
+            logger.error("  Windows: Download from https://graphviz.org/download/")
+            logger.error("Then install pygraphviz: pip install pygraphviz")
+            return None
+
+    def visualize_hierarchy_marker(self, cutoff=0.5, max_children=None, output_file=None, figsize=(20, 12)):
+        """
+        Visualize the cell hierarchy with marker gene information.
+        
+        This method creates a hierarchy visualization where:
+        - Cell types with no entry in sorted_empirical_table are shown in grey
+        - Cell types with no marker genes passing the cutoff are shown in red
+        - Cell types with marker genes show the marker name alongside the cell type
+        
+        Args:
+            annotation_columns (list): List of column names in adata.obs for hierarchy levels
+            cutoff (float): Score cutoff threshold for marker genes
+            max_children (int, optional): Maximum number of children to include for each node
+            output_file (str, optional): Path to save the figure
+            figsize (tuple): Figure size (width, height)
+            
+        Returns:
+            matplotlib.figure.Figure: Figure object with the hierarchy visualization
+        """
+        # Check if marker analysis has been run
+        if self.sorted_empirical_table is None and self.sorted_table is None:
+            raise ValueError("No marker analysis results available. Run ScSherlock.run() first")
+            
+        # Determine which sorted table to use based on what's available
+        if self.sorted_empirical_table is not None:
+            sorted_table = self.sorted_empirical_table
+            logger.info("Using empirical marker scores for visualization")
+        else:
+            sorted_table = self.sorted_table
+            logger.info("Using theoretical marker scores for visualization")
+        
+        if hasattr(self, 'G') and self.G is not None:
+            G = self.G
+        else:
+            raise ValueError("No hierarchical graph present in ScSherlock object. Ensure hierarchy creation is successful.")
+
+            
+        
+        plt.figure(figsize=figsize)
+        
+        try:
+            # Use dot layout for hierarchical trees
+            pos = graphviz_layout(G, prog='twopi')
+            
+            # Get node depths for coloring
+            node_depth = {}
+            for node in G.nodes():
+                node_depth[node] = 0 if node == 'root' else node.count('_') + 1
+            
+            max_depth = max(node_depth.values())
+            
+            # Prepare node colors based on marker genes status
+            node_colors = []
+            for node in G.nodes():
+                if node == 'root':
+                    # Root node is always blue
+                    node_colors.append('royalblue')
+                    continue
+                    
+                # Extract cell type name from node
+                if 'label' in G.nodes[node]:
+                    cell_type = G.nodes[node]['label']
+                else:
+                    parts = node.split('_')
+                    cell_type = parts[-1]
+                
+                # Check if cell type has markers
+                if cell_type in sorted_table:
+                    # Check if there are markers passing the cutoff
+                    if not sorted_table[cell_type].empty and sorted_table[cell_type]['aggregated'].max() >= cutoff:
+                        # Has marker passing cutoff - use a gradient based on depth
+                        node_colors.append(plt.cm.viridis(node_depth[node]/max_depth))
+                    else:
+                        # Has entry but no marker passing cutoff - red
+                        node_colors.append('red')
+                else:
+                    # No entry in sorted_table - grey
+                    node_colors.append('grey')
+            
+            # Prepare edge widths
+            edge_widths = [G.edges[edge].get('weight', 0.5) * 3 + 0.5 for edge in G.edges()]
+            
+            # Prepare node labels with marker information
+            labels = {}
+            for node in G.nodes():
+                if node == 'root':
+                    labels[node] = 'ROOT'
+                    continue
+                    
+                # Extract cell type name
+                if 'label' in G.nodes[node]:
+                    cell_type = G.nodes[node]['label']
+                else:
+                    parts = node.split('_')
+                    cell_type = parts[-1]
+                
+                # Check if cell type has markers
+                if cell_type in sorted_table and not sorted_table[cell_type].empty:
+                    # Get marker genes passing the cutoff
+                    markers_passing = sorted_table[cell_type][sorted_table[cell_type]['aggregated'] >= cutoff]
+                    
+                    if not markers_passing.empty:
+                        # Get top marker gene
+                        top_marker = markers_passing.index[0]
+                        labels[node] = f"{cell_type}\n[{top_marker}]"
+                    else:
+                        # No markers passing cutoff
+                        labels[node] = f"{cell_type}\n[no marker]"
+                else:
+                    # No entry in sorted_table
+                    labels[node] = f"{cell_type}"
+                    
+            
+            # Draw the graph
+            nx.draw(G, pos, 
+                    node_color=node_colors,
+                    node_size=1000,  # Larger nodes for better readability
+                    width=edge_widths,
+                    with_labels=True,
+                    labels=labels,
+                    font_size=9,
+                    font_weight='bold',
+                    arrows=True,
+                    edge_color='gray',
+                    alpha=0.9)
+            
+            # Add legend
+            legend_elements = [
+                plt.Line2D([0], [0], marker='o', color='w', label='With marker gene',
+                        markerfacecolor=plt.cm.viridis(0.5), markersize=10),
+                plt.Line2D([0], [0], marker='o', color='w', label='No marker passing cutoff',
+                        markerfacecolor='red', markersize=10),
+                plt.Line2D([0], [0], marker='o', color='w', label='Cell type not analyzed',
+                        markerfacecolor='grey', markersize=10),
+                plt.Line2D([0], [0], marker='o', color='w', label='Root',
+                        markerfacecolor='royalblue', markersize=10)
+            ]
+            plt.legend(handles=legend_elements, loc='lower right', fontsize=9)
+            
+            plt.title(f'Cell Type Hierarchy with Marker Genes (cutoff={cutoff})', fontsize=15)
+            plt.axis('off')
+            
+            # Save if output file is specified
+            if output_file:
+                plt.savefig(output_file, dpi=300, bbox_inches='tight')
+            
+            fig = plt.gcf()
+            plt.show()
+            return fig
+            
+        except Exception as e:
+            logger.error(f"Error with visualization: {e}")
+            logger.error("Make sure Graphviz is installed:")
+            logger.error("  Ubuntu/Debian: sudo apt-get install graphviz graphviz-dev")
+            logger.error("  macOS: brew install graphviz")
+            logger.error("  Windows: Download from https://graphviz.org/download/")
+            logger.error("Then install pygraphviz: pip install pygraphviz")
+            return None
+
+
+# Keep the Numba-optimized scoring functions
+@nb.jit(nopython=True)
+def compute_diff_scores(alpha, beta):
+    """
+    Compute the maximum difference between beta and alpha.
+    """
+    n_genes, n_thresholds = alpha.shape
+    scores = np.zeros(n_genes)
+    
+    for g in range(n_genes):
+        max_diff = -1.0
+        for t in range(n_thresholds):
+            diff = beta[g, t] - alpha[g, t]
+            if diff > max_diff:
+                max_diff = diff
+        scores[g] = max_diff
+        
+    return scores
+
+@nb.jit(nopython=True)
+def compute_sensFPRzero_scores(alpha, beta):
+    """
+    Compute sensitivity at point of zero false positive rate.
+    """
+    n_genes, n_thresholds = alpha.shape
+    scores = np.zeros(n_genes)
+    
+    for g in range(n_genes):
+        max_beta_idx = 0
+        max_beta = -1.0
+        for t in range(n_thresholds):
+            if beta[g, t] > max_beta:
+                max_beta = beta[g, t]
+                max_beta_idx = t
+        scores[g] = 1.0 - alpha[g, max_beta_idx]
+        
+    return scores
+
+@nb.jit(nopython=True)
+def compute_sensPPV99_scores(alpha, beta):
+    """
+    Compute sensitivity at point where positive predictive value > 99%.
+    """
+    n_genes, n_thresholds = alpha.shape
+    scores = np.zeros(n_genes)
+    
+    for g in range(n_genes):
+        max_idx = -1
+        for t in range(n_thresholds):
+            # Calculate PPV, handling division by zero
+            denominator = 2.0 - alpha[g, t] - beta[g, t]
+            if denominator == 0:
+                ppv = 0.0
+            else:
+                ppv = (1.0 - alpha[g, t]) / denominator
+                
+            if ppv > 0.99 and max_idx == -1:
+                max_idx = t
+                
+        if max_idx != -1:
+            scores[g] = 1.0 - alpha[g, max_idx]
+        else:
+            scores[g] = 0.0
+            
+    return scores

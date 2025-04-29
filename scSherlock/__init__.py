@@ -1,1 +1,1 @@
-from .sherlock_obj import *
+from .sherlock_obj_multiannotation import *
