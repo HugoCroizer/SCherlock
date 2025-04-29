@@ -69,3 +69,9 @@ html_static_path = ['_static']
 html_css_files = [
     'custom.css',
 ]
+
+latex_documents = [
+    ('index', 'scSherlock.tex', 'scSherlock Documentation',
+     'Author Name', 'manual'),
+]
+
