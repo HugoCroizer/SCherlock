@@ -17,9 +17,6 @@ sphinx:
   # You might need to enable this if you use autodoc to include docstrings
   fail_on_warning: false
 
-# Optionally build your docs in additional formats such as PDF
-formats:
-  - pdf
 
 # Python requirements for building the documentation
 python:
