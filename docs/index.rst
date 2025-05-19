@@ -1,7 +1,7 @@
 .. scSherlock documentation master file
 
 =======================================
-scSherlock
+SCherlock
 =======================================
 
 .. image:: ../images/logo.png
@@ -9,7 +9,7 @@ scSherlock
    :align: right
    :alt: scSherlock logo
 
-**scSherlock** is a robust statistical approach for identifying marker genes that leverages both theoretical probability distributions and empirical validation through simulation. The method evaluates gene expression patterns across multiple aggregation levels to identify genes that reliably distinguish target cell types from others. SCherlock incorporates patient-level information to ensure markers are consistent across biological replicates, and employs multiple scoring strategies to optimize for different marker characteristics. 
+**SCherlock** is a robust statistical approach for identifying marker genes that leverages both theoretical probability distributions and empirical validation through simulation. The method evaluates gene expression patterns across multiple aggregation levels to identify genes that reliably distinguish target cell types from others. SCherlock incorporates patient-level information to ensure markers are consistent across biological replicates, and employs multiple scoring strategies to optimize for different marker characteristics. 
 
 .. note::
    This project is under active development.
@@ -18,11 +18,11 @@ scSherlock
 Installation
 ===========
 
-You can install scSherlock via pip:
+You can install SCherlock via pip:
 
 .. code-block:: bash
 
-   pip install scSherlock
+   pip install SCherlock
 
 Quick Start
 ==========
@@ -30,7 +30,7 @@ Quick Start
 .. code-block:: python
    
    import scanpy as sc
-   from scherlock import SCherlock, SCherlockConfig, ScoringMethod
+   from SCherlock import SCherlock, SCherlockConfig, ScoringMethod
 
    # Load your data
    adata = sc.read("your_data.h5ad")
