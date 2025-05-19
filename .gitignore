@@ -2,3 +2,7 @@ data/
 testing.py
 testing.ipynb
 class_code_testing.ipynb
+*.csv
+*.png
+*.pdf
+*.ipynb

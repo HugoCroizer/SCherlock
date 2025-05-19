@@ -1,16 +1,15 @@
-# scSherlock
+# SCherlock
 
 ## Overview
 <img src="images/logo.png" align="right" width="125px" />
-scSherlock is a statistical algorithm for identifying cell type-specific marker genes from single-cell RNA sequencing data. The algorithm uses probabilistic models to identify genes that are specifically expressed in target cell types but not in other cell types, making them reliable markers for cell type identification.  
+SCherlock is a statistical algorithm for identifying cell type-specific marker genes from single-cell RNA sequencing data. The algorithm uses probabilistic models to identify genes that are specifically expressed in target cell types but not in other cell types, making them reliable markers for cell type identification.  
 
-Documentation is available here : https://scsherlock.readthedocs.io/en/latest/  
-The R version of scSherlock is available at : 
+Documentation is available here : https://SCherlock.readthedocs.io/en/latest/  
 
 ## Installation
 
 ```bash
-pip install scsherlock
+pip install scherlock
 ```
 
 ## Quick Start
@@ -22,40 +21,27 @@ from scherlock import SCherlock, SCherlockConfig, ScoringMethod
 # Load your data
 adata = sc.read("your_data.h5ad")
 
-# Configure SCherlock
-config = SCherlockConfig(
-    k_values=[1, 10, 25],              # Cell aggregation levels to evaluate
-    scoring_method=ScoringMethod.DIFF, # Scoring method for marker evaluation
-    max_genes_kept=100,                # Maximum number of genes to keep per cell type
-    min_patients=3,                    # Minimum number of patients expressing the gene
-    min_reads=10,                      # Minimum number of reads for a gene
-    min_cells=10                       # Minimum number of cells expressing the gene
-)
-
 # Initialize SCherlock
 scherlock = SCherlock(
     adata=adata,
-    column_ctype="cell_type",          # Column in adata.obs for cell type annotations
     column_patient="patient_id",       # Column in adata.obs for patient IDs
     config=config
 )
 
 # Run the algorithm
-top_markers = scherlock.run()
+top_markers = scherlock.run(column_ctype='cell_type')
 
-# Export results
-markers_df = scherlock.export_markers("markers.csv")
+# Plot marker heatmap
+scherlock.plot_marker_heatmap(n_genes=1, column_ctype=cell_type_column, cutoff=0)
 
-# Visualize top marker
-scherlock.visualize_marker("TOP_MARKER_GENE")
+# Get top 3 markers for each cell type with a score > 0.5
+scherlock.get_marker(column_ctype='cell_type', n_top_genes=3, min_score=0.5)
 
-# Generate heatmap of markers
-scherlock.plot_marker_heatmap(n_genes=5)
 ```
 
 ## Citation
 
-If you use scSherlock in your research, please cite:
+If you use SCherlock in your research, please cite:
 
 ```
 [Citation information will be added here]

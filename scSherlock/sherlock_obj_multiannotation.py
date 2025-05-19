@@ -54,12 +54,12 @@ class ScSherlockConfig:
     min_patients: int = 3
     min_reads: int = 10
     min_cells: int = 10
-    score_cutoff: float = 0.5
+    score_cutoff: float = 0
     n_simulations: int = 1000
     random_seed: int = 0
     sparse_step: int = 5  # Step size for sparse sampling optimization
     promising_threshold: float = 0.1  # Threshold for identifying promising genes
-    n_jobs: int = 1
+    n_jobs: int = -1
     batch_size: int=5 # Number of cell types to process in parallel
     
     def __post_init__(self):
@@ -86,9 +86,11 @@ class ScSherlock:
             config: Configuration object with algorithm parameters (optional)
         """
         self.adata = adata
+        self._check_duplicate_genes()
         self.column_patient = column_patient
         self.config = config or ScSherlockConfig()
-        self.column_patient = self.simplify_patient_ids()        
+        self.column_patient = self.simplify_patient_ids()     
+        self._check_raw_counts()   
         # Validate inputs
         self._validate_inputs()
         
@@ -114,6 +116,52 @@ class ScSherlock:
         """Validate input data and parameters"""
         if self.column_patient not in self.adata.obs.columns:
             raise ValueError(f"Patient column '{self.column_patient}' not found in adata.obs")
+
+    def _check_raw_counts(self):
+        """
+        Check if the data appears to be raw counts by verifying values are integers.
+        
+        Raises:
+            Warning: If the data contains non-integer values, suggesting it's normalized
+        """
+        # Sample a subset of the data for efficiency
+        sample_size = min(1000, self.adata.shape[0])
+        sample_indices = np.random.choice(self.adata.shape[0], sample_size, replace=False)
+        
+        # Check if data is sparse
+        is_sparse = scipy.sparse.issparse(self.adata.X)
+        
+        # Extract a sample of the data
+        if is_sparse:
+            sample_data = self.adata.X[sample_indices].toarray()
+        else:
+            sample_data = self.adata.X[sample_indices]
+        
+        # Check if values are integers by comparing them to their rounded versions
+        # Use a small tolerance to account for floating-point precision issues
+        has_non_integer = np.any(np.abs(sample_data - np.round(sample_data)) > 1e-10)
+        
+        if has_non_integer:
+            warning_msg = "Data contains non-integer values, suggesting it may be normalized or scaled. " \
+                        "ScSherlock is designed to work with raw count data."
+            logger.warning(warning_msg)
+
+    def _check_duplicate_genes(self):
+        """
+        Check for duplicate gene names in AnnData object and make them unique if found
+            
+        Returns:
+            None, but modifies adata.var_names in-place if duplicates are found
+        """
+        # Check if var_names contains duplicates
+        has_duplicates = len(self.adata.var_names) != len(self.adata.var_names.unique())
+        
+        if has_duplicates:
+            logger.warning(f"Found duplicate gene names in the dataset")
+            # Make var_names unique using scanpy
+            logger.info("Making gene names unique using sc.pp.var_names_make_unique()...")
+            self.adata.var_names_make_unique()
+
 
     def _prefilter_genes(self, min_cells=10, min_counts=10):
         """Pre-filter genes to reduce computation time
@@ -1848,12 +1896,11 @@ class ScSherlock:
         else:
             logger.info("No data available for depth analysis")
 
-    def visualize_hierarchy(self, min_proportion=0.05, max_children=None, output_file=None, figsize=(20, 12)):
+    def visualize_hierarchy(self, min_proportion=0.05, max_children=None, output_file=None, figsize=(20, 12), show_proportions=False, font_size=9):
         """
-        Visualize the cell hierarchy using a hierarchical graph layout.
+        Visualize the cell hierarchy using a hierarchical graph layout with children of the same parent colored the same.
         
         Args:
-            annotation_columns (list): List of column names in adata.obs for hierarchy levels
             min_proportion (float): Minimum proportion threshold for including relationships
             max_children (int, optional): Maximum number of children to include for each node
             output_file (str, optional): Path to save the figure
@@ -1866,24 +1913,51 @@ class ScSherlock:
             G = self.G
         else:
             raise ValueError("No hierarchical graph present in ScSherlock object. Ensure hierarchy creation is successful.")
-
-            
-
-        plt.figure(figsize=figsize)
         
+        plt.figure(figsize=figsize)
         try:
             # Use dot layout for hierarchical trees
             pos = graphviz_layout(G, prog='twopi')
             
-            # Get node depths for coloring
-            node_depth = {}
+            # Get parent-child relationships for coloring
+            parent_to_children = {}
+            for edge in G.edges():
+                parent, child = edge
+                if parent not in parent_to_children:
+                    parent_to_children[parent] = []
+                parent_to_children[parent].append(child)
+            
+            # Create a color mapping for each parent's children
+            color_mapping = {}
+            color_cycle = plt.cm.tab20.colors  # Use a colormap with distinct colors
+            
+            # Start with root
+            if 'root' in G.nodes():
+                color_mapping['root'] = plt.cm.tab20(0)  # Root gets first color
+                
+                # Assign colors to each parent's children group
+                color_idx = 0
+                for parent in parent_to_children:
+                    if parent == 'root':
+                        # Root's direct children each get their own color family
+                        for i, child in enumerate(parent_to_children[parent]):
+                            color_idx = (color_idx + 1) % len(color_cycle)
+                            color_mapping[child] = plt.cm.tab20(color_idx)
+                    else:
+                        # All children of the same non-root parent get the parent's color
+                        parent_color = color_mapping.get(parent)
+                        if parent_color is not None:
+                            for child in parent_to_children[parent]:
+                                color_mapping[child] = parent_color
+            
+            # Add colors for any missed nodes
             for node in G.nodes():
-                node_depth[node] = 0 if node == 'root' else node.count('_') + 1
+                if node not in color_mapping:
+                    color_idx = (color_idx + 1) % len(color_cycle)
+                    color_mapping[node] = plt.cm.tab20(color_idx)
             
-            max_depth = max(node_depth.values())
-            
-            # Prepare node colors
-            node_colors = [plt.cm.viridis(depth/max_depth) for node, depth in node_depth.items()]
+            # Get node colors based on the mapping
+            node_colors = [color_mapping.get(node, plt.cm.tab20(0)) for node in G.nodes()]
             
             # Prepare edge widths
             edge_widths = [G.edges[edge].get('weight', 0.5) * 3 + 0.5 for edge in G.edges()]
@@ -1895,7 +1969,7 @@ class ScSherlock:
                     labels[node] = 'ROOT'
                 elif 'label' in G.nodes[node]:
                     label = G.nodes[node]['label']
-                    if 'proportion' in G.nodes[node] and node != 'root':
+                    if 'proportion' in G.nodes[node] and node != 'root' and show_proportions==True:
                         prop = G.nodes[node]['proportion']
                         labels[node] = f"{label}\n({prop:.1%})"
                     else:
@@ -1903,15 +1977,15 @@ class ScSherlock:
                 else:
                     parts = node.split('_')
                     labels[node] = parts[-1]
-            
+                    
             # Draw the graph
-            nx.draw(G, pos, 
+            nx.draw(G, pos,
                     node_color=node_colors,
                     node_size=800,
                     width=edge_widths,
                     with_labels=True,
                     labels=labels,
-                    font_size=9,
+                    font_size=font_size,
                     font_weight='bold',
                     arrows=True,
                     edge_color='gray',
@@ -1923,21 +1997,21 @@ class ScSherlock:
             # Save if output file is specified
             if output_file:
                 plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            
+                
             fig = plt.gcf()
             return fig
             
         except Exception as e:
             logger.error(f"Error with graphviz_layout: {e}")
             logger.error("Make sure Graphviz is installed:")
-            logger.error("  Ubuntu/Debian: sudo apt-get install graphviz graphviz-dev")
-            logger.error("  macOS: brew install graphviz")
-            logger.error("  Windows: Download from https://graphviz.org/download/")
+            logger.error(" Ubuntu/Debian: sudo apt-get install graphviz graphviz-dev")
+            logger.error(" macOS: brew install graphviz")
+            logger.error(" Windows: Download from https://graphviz.org/download/")
             logger.error("Then install pygraphviz: pip install pygraphviz")
             return None
-
+        
     def visualize_hierarchy_marker(self, column_ctype=None, cutoff=0.5, output_file=None, figsize=(20, 12), 
-                              show_score=True, dataset_column=None, score_type='weighted_score'):
+                              show_score=True, dataset_column=None, score_type='weighted_score', cmap='coolwarm'):
         """
         Visualize the cell hierarchy with marker gene information.
         
@@ -2171,11 +2245,13 @@ class ScSherlock:
             
             max_depth = max(node_depth.values())
             
-            # Import colormap for score-based coloring
-            from matplotlib.colors import LinearSegmentedColormap
-            
-            # Create a custom colormap from blue (low score) to red (high score)
-            score_cmap = plt.cm.get_cmap('viridis')
+            # Create colormap from user input or use default 'viridis'
+            try:
+                score_cmap = plt.cm.get_cmap(cmap)
+                logger.info(f"Using colormap: {cmap}")
+            except ValueError:
+                logger.warning(f"Invalid colormap '{cmap}'. Defaulting to 'viridis'")
+                score_cmap = plt.cm.get_cmap('viridis')
             
             # Prepare node colors based on marker gene status
             node_colors = []
@@ -2505,7 +2581,7 @@ class ScSherlock:
             logger.info(f"  {passed}/{total} markers passed bootstrap validation ({passed/total*100:.1f}%)")
             logger.info(f"  Mean scores - Original: {np.mean(original_scores):.3f}, Subset1: {np.mean(subset1_scores):.3f}, Subset2: {np.mean(subset2_scores):.3f}")
 
-    def run_dataset(self, column_ctype: str, column_dataset: str, min_shared: int = 1, method: str = "empiric", bootstrap: bool = False) -> Dict[str, Dict[str, List[str]]]:
+    def run_dataset(self, column_ctype: str, column_dataset: str, min_shared: int = 1, method: str = "empiric", bootstrap: bool = False, verbose: int = 1) -> Dict[str, Dict[str, List[str]]]:
         """
         Run ScSherlock on each dataset separately and identify shared marker genes across datasets.
         
@@ -2521,6 +2597,7 @@ class ScSherlock:
             min_shared: Minimum number of datasets that must share a marker (default: 1)
             method: Method to use, either "theoric" or "empiric"
             bootstrap: Whether to perform bootstrap validation of markers
+            verbose: Verbosity level (0: no output, 1: essential output only, 2: full output)
                 
         Returns:
             Dict[str, Dict[str, List[str]]]: Dictionary mapping cell types to datasets and their shared markers
@@ -2537,11 +2614,13 @@ class ScSherlock:
             
         # Get all datasets
         datasets = self.adata.obs[column_dataset].unique()
-        logger.info(f"Found {len(datasets)} datasets: {', '.join(datasets)}")
+        if verbose > 0:
+            logger.info(f"Found {len(datasets)} datasets: {', '.join(datasets)}")
         
         # Get all cell types
         cell_types = self.adata.obs[column_ctype].unique()
-        logger.info(f"Found {len(cell_types)} cell types in the combined data")
+        if verbose > 0:
+            logger.info(f"Found {len(cell_types)} cell types in the combined data")
         
         # Dictionary to store results for each dataset
         dataset_markers = {}
@@ -2575,23 +2654,29 @@ class ScSherlock:
         
         # Run ScSherlock on each dataset
         for dataset in datasets:
-            logger.info(f"Processing dataset: {dataset}")
+            if verbose > 1:
+                logger.info(f"Processing dataset: {dataset}")
+            elif verbose == 1:
+                logger.info(f"Processing dataset: {dataset}")
             
             # Subset the AnnData object for this dataset
             adata_subset = self.adata[self.adata.obs[column_dataset] == dataset].copy()
             
             # Check if dataset has enough cells
             if adata_subset.shape[0] < self.config.min_cells:
-                logger.warning(f"Dataset {dataset} has only {adata_subset.shape[0]} cells, which is below the minimum threshold of {self.config.min_cells}. Skipping.")
+                if verbose > 0:
+                    logger.warning(f"Dataset {dataset} has only {adata_subset.shape[0]} cells, which is below the minimum threshold of {self.config.min_cells}. Skipping.")
                 continue
             
             # Check which cell types are present in this dataset
             dataset_cell_types = adata_subset.obs[column_ctype].unique()
-            logger.info(f"Dataset {dataset} has {len(dataset_cell_types)} cell types")
+            if verbose > 1:
+                logger.info(f"Dataset {dataset} has {len(dataset_cell_types)} cell types")
             
             # Skip if no cell types or too few cells
             if len(dataset_cell_types) == 0:
-                logger.warning(f"Dataset {dataset} has no cell types. Skipping.")
+                if verbose > 0:
+                    logger.warning(f"Dataset {dataset} has no cell types. Skipping.")
                 continue
             
             # Create a new ScSherlock instance for this dataset
@@ -2639,9 +2724,11 @@ class ScSherlock:
                 # Store dataset scores
                 self.__dict__[dataset_key]['dataset_scores'][dataset] = dataset_scores[dataset]
                     
-                logger.info(f"Successfully processed dataset {dataset}. Found markers for {len(top_markers)} cell types.")
+                if verbose > 1:
+                    logger.info(f"Successfully processed dataset {dataset}. Found markers for {len(top_markers)} cell types.")
             except Exception as e:
-                logger.error(f"Error processing dataset {dataset}: {e}")
+                if verbose > 0:
+                    logger.error(f"Error processing dataset {dataset}: {e}")
                 continue
         
         # Identify shared markers across datasets - without applying score cutoffs
@@ -2729,13 +2816,17 @@ class ScSherlock:
         
         # Log summary of shared markers
         total_shared = sum(len(markers) for markers in shared_markers.values())
-        logger.info(f"Found {total_shared} markers shared across at least {min_shared} datasets (no score cutoff applied).")
+        if verbose > 0:
+            logger.info(f"Found {total_shared} markers shared across at least {min_shared} datasets (no score cutoff applied).")
         
-        for ctype, markers in shared_markers.items():
-            if markers:
-                logger.info(f"Cell type {ctype}: {len(markers)} shared markers")
+        if verbose > 1:
+            for ctype, markers in shared_markers.items():
+                if markers:
+                    logger.info(f"Cell type {ctype}: {len(markers)} shared markers")
+        
         # Update standard tables with the dataset analysis results
-        logger.info("Updating standard tables with dataset analysis results...")
+        if verbose > 0:
+            logger.info("Updating standard tables with dataset analysis results...")
         
         # For each cell type, update the tables
         cells_updated = 0
@@ -2825,7 +2916,8 @@ class ScSherlock:
                 top_marker = table.index[0]
                 self.top_markers[column_ctype][cell_type] = top_marker
         
-        logger.info(f"Updated standard tables with {cells_updated} cell types, {markers_updated} markers")
+        if verbose > 0:
+            logger.info(f"Updated standard tables with {cells_updated} cell types, {markers_updated} markers")
 
         # Return the shared markers
         return shared_markers
@@ -3785,91 +3877,369 @@ class ScSherlock:
         return G
 
     
-
-
-    def plot_cluster_dendrogram(self, annotation_column, max_depth=3, 
-                            linkage_method="ward", distance_metric="correlation",
-                            figsize=(12, 8), color_threshold=None, output_file=None):
+    def curate_hierarchy_markers(self, method: str = "empiric", min_score: float = 0, top_n: int = None, 
+                            display_graph: bool = True, figsize: tuple = (20, 12), 
+                            output_file: str = None) -> Dict:
         """
-        Plot the hierarchical clustering dendrogram for the pseudobulk profiles.
+        Curate marker genes based on the hierarchy graph to ensure level-specific markers.
+        
+        This method:
+        1. Uses the annotation information stored in the hierarchy graph nodes
+        2. Finds all markers for each cell type at each level using the appropriate sorted table
+        3. Filters out markers from parent nodes that appear in ANY of their children,
+        but only if the parent has more than one child
+        4. Optionally limits to the top N markers per cell type
+        5. Optionally displays the hierarchy graph with the curated markers
         
         Args:
-            annotation_column (str): Column name in adata.obs for cell type annotations
-            max_depth (int): Maximum depth to show in the dendrogram (default: 3)
-            linkage_method (str): Method for hierarchical clustering (default: "ward")
-            distance_metric (str): Distance metric for hierarchical clustering (default: "correlation")
-            figsize (tuple): Figure size (width, height)
-            color_threshold (float, optional): The threshold to use for coloring clusters
-            output_file (str, optional): Path to save the figure
+            method: Method to use for marker scores, either "theoric" or "empiric" (default: "empiric")
+            min_score: Minimum score threshold for including markers (default: 0.5)
+            top_n: If provided, limit to top N markers per cell type (default: None, return all markers)
+            display_graph: Whether to display the hierarchy graph with curated markers (default: False)
+            figsize: Figure size for the graph as (width, height) (default: (20, 12))
+            output_file: Path to save the figure (default: None)
                 
         Returns:
-            matplotlib.figure.Figure: Figure object with the dendrogram
+            Dict: Dictionary with hierarchical markers organized by levels
+            
+        Raises:
+            ValueError: If no hierarchy graph is available or no markers are found
         """
+        import networkx as nx
         import matplotlib.pyplot as plt
-        import scipy.cluster.hierarchy as sch
-        import scipy.spatial.distance as ssd
-        import pandas as pd
         
-        # Create pseudobulk profiles
-        adata_agg = ADPBulk(self.adata, annotation_column)
-        pseudobulk_matrix = adata_agg.fit_transform()
-        sample_meta = adata_agg.get_meta()
+        # Check if a hierarchy graph exists
+        if not hasattr(self, 'G') or self.G is None:
+            raise ValueError("No hierarchical graph present in ScSherlock object. Call create_hierarchy_graph first.")
+            
+        # Get the graph
+        G = self.G
         
-        # Set index to annotation column
-        pseudobulk_matrix.set_index(sample_meta[annotation_column], inplace=True)
+        # Validate method parameter
+        if method not in ["theoric", "empiric"]:
+            raise ValueError('Method must be either "theoric" or "empiric"')
         
-        # Compute distance matrix
-        if distance_metric == "correlation":
-            corr_matrix = pseudobulk_matrix.T.corr()
-            dist_matrix = 1 - corr_matrix
-            dist_matrix = dist_matrix.fillna(1.0)
-            condensed_dist = ssd.squareform(dist_matrix)
-        elif distance_metric == "cosine":
-            condensed_dist = ssd.pdist(pseudobulk_matrix, metric="cosine")
-        else:
-            condensed_dist = ssd.pdist(pseudobulk_matrix, metric="euclidean")
+        # Get all nodes except root
+        nodes = [n for n in G.nodes() if n != 'root']
         
-        # Perform hierarchical clustering
-        Z = sch.linkage(condensed_dist, method=linkage_method)
+        # Create a dictionary to store level -> cell_type -> markers
+        hierarchy_markers = {}
         
-        # Plot dendrogram
-        plt.figure(figsize=figsize)
+        # Get node levels
+        node_levels = {}
+        max_level = 0
         
-        # Define color threshold based on max_depth if not specified
-        if color_threshold is None:
-            # Calculate automatic color threshold based on max_depth
-            n_clusters = max(1, min(len(pseudobulk_matrix) - max_depth, len(pseudobulk_matrix) // (2**(max_depth-1))))
-            # Use fcluster to get the threshold that would give n_clusters
-            threshold = sch.fcluster(Z, n_clusters, criterion='maxclust')
-            # Get unique cluster assignments
-            unique_clusters = pd.Series(threshold).unique()
-            if len(unique_clusters) > 1:
-                # Use the minimum threshold that gives the desired number of clusters
-                color_threshold = min(Z[-(n_clusters-1):, 2])
+        for node in nodes:
+            if 'level' in G.nodes[node]:
+                level = G.nodes[node]['level']
+                node_levels[node] = level
+                max_level = max(max_level, level)
             else:
-                color_threshold = 0
+                # If level is not explicitly stored, calculate based on path length from root
+                try:
+                    level = len(nx.shortest_path(G, 'root', node)) - 1
+                    node_levels[node] = level
+                    max_level = max(max_level, level)
+                except nx.NetworkXNoPath:
+                    logger.warning(f"No path from root to node {node}, skipping")
+                    continue
         
-        # Plot the dendrogram
-        dendrogram = sch.dendrogram(
-            Z,
-            labels=pseudobulk_matrix.index,
-            orientation='right',
-            leaf_font_size=10,
-            color_threshold=color_threshold
-        )
+        # Group nodes by level
+        nodes_by_level = {}
+        for node, level in node_levels.items():
+            if level not in nodes_by_level:
+                nodes_by_level[level] = []
+            nodes_by_level[level].append(node)
         
-        # Add labels and title
-        plt.title(f'Hierarchical Clustering of {annotation_column}\n({linkage_method} linkage, {distance_metric} distance)', fontsize=14)
-        plt.xlabel('Distance', fontsize=12)
-        plt.tight_layout()
+        logger.info(f"Found {len(nodes)} nodes across {max_level+1} levels")
+        for level in range(max_level+1):
+            nodes_count = len(nodes_by_level.get(level, []))
+            logger.info(f"Level {level} has {nodes_count} nodes")
         
-        # Save if output file is specified
-        if output_file:
-            plt.savefig(output_file, dpi=300, bbox_inches='tight')
-            print(f"Saved dendrogram to {output_file}")
+        # Get cell type and annotation for each node
+        node_celltypes = {}
+        node_annotations = {}
         
-        return plt.gcf()
+        for node in nodes:
+            # Get cell type name from node label or node name
+            if 'label' in G.nodes[node]:
+                node_celltypes[node] = G.nodes[node]['label']
+            else:
+                # Extract from node name
+                parts = node.split('_')
+                node_celltypes[node] = parts[-1]
+                
+            # Get annotation from node attribute
+            if 'annotation' in G.nodes[node]:
+                node_annotations[node] = G.nodes[node]['annotation']
+            else:
+                # If annotation not specified, use a default value
+                node_annotations[node] = "unknown_annotation"
+        
+        # First pass: Get initial markers for each node
+        logger.info("Getting initial markers for each node...")
+        
+        # Dictionary to store initial markers and their scores for each node
+        initial_markers = {}
+        marker_scores = {}
+        
+        # Count markers per level
+        markers_per_level = {level: 0 for level in range(max_level+1)}
+        
+        for node in nodes:
+            cell_type = node_celltypes[node]
+            annotation = node_annotations[node]
+            level = node_levels[node]
+            
+            # Ensure the annotation has been analyzed
+            if annotation not in self.method_run:
+                logger.warning(f"Annotation '{annotation}' has not been analyzed. Skipping node {node}.")
+                initial_markers[node] = []
+                marker_scores[node] = {}
+                continue
+            
+            # Get the appropriate table based on the method and annotation
+            if method == "empiric":
+                if annotation not in self.sorted_empirical_table or self.sorted_empirical_table[annotation] is None:
+                    logger.warning(f"Empirical scores not found for annotation '{annotation}'. Skipping node {node}.")
+                    initial_markers[node] = []
+                    marker_scores[node] = {}
+                    continue
+                sorted_table = self.sorted_empirical_table[annotation]
+            else:  # method == "theoric"
+                if annotation not in self.sorted_table or self.sorted_table[annotation] is None:
+                    logger.warning(f"Theoretical scores not found for annotation '{annotation}'. Skipping node {node}.")
+                    initial_markers[node] = []
+                    marker_scores[node] = {}
+                    continue
+                sorted_table = self.sorted_table[annotation]
+            
+            # Skip if cell type not in table or table is empty
+            if cell_type not in sorted_table or not isinstance(sorted_table[cell_type], pd.DataFrame) or sorted_table[cell_type].empty:
+                logger.info(f"No markers found for cell type '{cell_type}' in annotation '{annotation}'.")
+                initial_markers[node] = []
+                marker_scores[node] = {}
+                continue
+            
+            # Get markers that pass the threshold
+            score_col = 'weighted_score' if 'weighted_score' in sorted_table[cell_type].columns else 'aggregated'
+            markers_df = sorted_table[cell_type][sorted_table[cell_type][score_col] >= min_score]
+            
+            # Skip if no markers pass threshold
+            if markers_df.empty:
+                logger.info(f"No markers pass threshold for cell type '{cell_type}'.")
+                initial_markers[node] = []
+                marker_scores[node] = {}
+                continue
+                
+            # Get all markers that pass the threshold with their scores
+            markers_dict = markers_df[score_col].to_dict()
+            
+            # Store markers and their scores for this node
+            initial_markers[node] = list(markers_dict.keys())
+            marker_scores[node] = markers_dict
+            
+            # Update markers count for this level
+            markers_per_level[level] += len(markers_dict)
+            
+            logger.info(f"Found {len(markers_dict)} initial markers for node {node} (cell type: {cell_type})")
+        
+        # Log markers per level
+        for level in range(max_level+1):
+            logger.info(f"Level {level} has {markers_per_level[level]} initial markers")
+        
+        # Create a direct marker set for each node
+        direct_markers = {node: set(markers) for node, markers in initial_markers.items()}
+        
+        # Second pass: Curate markers by removing markers from parents that appear in any child
+        logger.info("Curating markers from bottom to top of hierarchy...")
+        
+        # Initialize hierarchy_markers for all levels
+        for level in range(max_level+1):
+            hierarchy_markers[level] = {}
+        
+        # Dictionary to store the final curated markers for each node (for visualization)
+        node_curated_markers = {}
+        
+        # Process levels from bottom to top
+        for level in range(max_level, -1, -1):
+            level_nodes = nodes_by_level.get(level, [])
+            
+            for node in level_nodes:
+                cell_type = node_celltypes[node]
+                
+                # Skip if no initial markers
+                if not direct_markers[node]:
+                    hierarchy_markers[level][cell_type] = []
+                    node_curated_markers[node] = []
+                    continue
+                
+                # Get all direct children of this node
+                children = list(G.successors(node))
+                
+                # Check if curating is needed (only if node has more than one child)
+                needs_curation = len(children) > 1
+                
+                if needs_curation:
+                    # Collect markers from all child nodes
+                    child_markers_set = set()
+                    for child in children:
+                        # Include markers from direct_markers for each child
+                        child_markers_set.update(direct_markers.get(child, set()))
+                        
+                        # Also consider all nodes in the subtree rooted at each child
+                        descendants = nx.descendants(G, child)
+                        for descendant in descendants:
+                            child_markers_set.update(direct_markers.get(descendant, set()))
+                    
+                    # Get markers specific to this node (not in any child)
+                    specific_markers = [m for m in direct_markers[node] if m not in child_markers_set]
+                else:
+                    # If node has 0 or 1 child, keep all its markers
+                    specific_markers = list(direct_markers[node])
+                    
+                    # Log that we're keeping all markers for this node
+                    if children:
+                        logger.info(f"Node {node} has only one child, keeping all {len(specific_markers)} markers")
+                    else:
+                        logger.info(f"Node {node} has no children, keeping all {len(specific_markers)} markers")
+                
+                # If we need to limit to top N markers, sort by score and take the top ones
+                if top_n is not None and specific_markers:
+                    # Create dictionary of marker -> score
+                    specific_marker_scores = {marker: marker_scores[node].get(marker, 0) for marker in specific_markers}
+                    
+                    # Sort markers by score (descending)
+                    sorted_markers = sorted(specific_marker_scores.items(), key=lambda x: x[1], reverse=True)
+                    
+                    # Take the top N markers (or all if fewer than N)
+                    specific_markers = [m for m, _ in sorted_markers[:top_n]]
+                
+                # Store curated markers for this node/cell type
+                hierarchy_markers[level][cell_type] = specific_markers
+                node_curated_markers[node] = specific_markers
+            
+            # Log progress
+            total_markers = sum(len(markers) for markers in hierarchy_markers[level].values())
+            logger.info(f"Level {level}: {len(level_nodes)} nodes, {total_markers} curated markers")
+        
+        # Check if we found any markers
+        total_curated = sum(sum(len(markers) for markers in level_dict.values()) 
+                            for level_dict in hierarchy_markers.values())
+        
+        if total_curated == 0:
+            logger.warning(f"No curated markers found. Try lowering the min_score parameter.")
+        else:
+            logger.info(f"Found {total_curated} curated markers across {len(nodes)} nodes")
+        
+        # Visualize the hierarchy with curated markers if requested
+        if display_graph:
+            try:
+                # Use dot layout for hierarchical trees
+                pos = nx.nx_agraph.graphviz_layout(G, prog='twopi')
+                
+                plt.figure(figsize=figsize)
+                
+                # Get parent-child relationships for coloring
+                parent_to_children = {}
+                for edge in G.edges():
+                    parent, child = edge
+                    if parent not in parent_to_children:
+                        parent_to_children[parent] = []
+                    parent_to_children[parent].append(child)
+                
+                # Create a color mapping for each parent's children
+                color_mapping = {}
+                color_cycle = plt.cm.tab20.colors  # Use a colormap with distinct colors
+                
+                # Start with root
+                if 'root' in G.nodes():
+                    color_mapping['root'] = plt.cm.tab20(0)  # Root gets first color
+                    
+                    # Assign colors to each parent's children group
+                    color_idx = 0
+                    for parent in parent_to_children:
+                        if parent == 'root':
+                            # Root's direct children each get their own color family
+                            for i, child in enumerate(parent_to_children[parent]):
+                                color_idx = (color_idx + 1) % len(color_cycle)
+                                color_mapping[child] = plt.cm.tab20(color_idx)
+                        else:
+                            # All children of the same non-root parent get the parent's color
+                            parent_color = color_mapping.get(parent)
+                            if parent_color is not None:
+                                for child in parent_to_children[parent]:
+                                    color_mapping[child] = parent_color
+                
+                # Add colors for any missed nodes
+                for node in G.nodes():
+                    if node not in color_mapping:
+                        color_idx = (color_idx + 1) % len(color_cycle)
+                        color_mapping[node] = plt.cm.tab20(color_idx)
+                
+                # Get node colors based on the mapping
+                node_colors = [color_mapping.get(node, plt.cm.tab20(0)) for node in G.nodes()]
+                
+                # Prepare edge widths based on weights
+                edge_widths = [G.edges[edge].get('weight', 0.5) * 3 + 0.5 for edge in G.edges()]
+                
+                # Prepare node labels with marker information
+                labels = {}
+                for node in G.nodes():
+                    if node == 'root':
+                        labels[node] = 'ROOT'
+                    else:
+                        # Get cell type name
+                        cell_type = node_celltypes.get(node, node)
+                        
+                        # Get markers for this node
+                        markers = node_curated_markers.get(node, [])
+                        
+                        if markers:
+                            # Create label with cell type and markers
+                            marker_str = ", ".join(markers[:3])  # Show up to 3 markers
+                            if len(markers) > 3:
+                                marker_str += f", +{len(markers)-3} more"
+                            labels[node] = f"{cell_type}\n[{marker_str}]"
+                        else:
+                            # No markers for this node
+                            labels[node] = f"{cell_type}\n[no markers]"
+                
+                # Draw the graph
+                nx.draw(G, pos,
+                        node_color=node_colors,
+                        node_size=800,
+                        width=edge_widths,
+                        with_labels=True,
+                        labels=labels,
+                        font_size=9,
+                        font_weight='bold',
+                        arrows=True,
+                        edge_color='gray',
+                        alpha=0.9)
+                
+                # Set title based on method and score threshold
+                plt.title(f'Cell Type Hierarchy with Curated Markers ({method} method, min_score={min_score})', fontsize=15)
+                
+                plt.axis('off')
+                
+                # Save if output file is specified
+                if output_file:
+                    plt.savefig(output_file, dpi=300, bbox_inches='tight')
+                    logger.info(f"Saved hierarchy visualization to {output_file}")
+                    
+                # Show the plot
+                plt.tight_layout()
+                plt.show()
+                
+            except Exception as e:
+                logger.error(f"Error visualizing hierarchy: {e}")
+                logger.error("Make sure Graphviz is installed for hierarchy visualization")
+        
+        return hierarchy_markers
 
+
+    
 
 @nb.jit(nopython=True)
 def compute_diff_scores(alpha, beta):
